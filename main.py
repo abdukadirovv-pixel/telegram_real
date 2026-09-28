@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION ---
-BOT_TOKEN = "8741655203:AAHMqMozxrl-qYsbkG_RKOPrwRSH512gNT8"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAHMqMozxrl-qYsbkG_RKOPrwRSH512gNT8")
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
 # --- DATABASE SETUP (Automatically remembers subscribers) ---
