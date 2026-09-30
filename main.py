@@ -11,15 +11,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAHMqMozxrl-qYsbkG_RKOPrwRSH512gNT8")
-OWNER_ID = int(os.getenv("OWNER_ID", "8780228920"))
+OWNER_ID = int(os.getenv("OWNER_ID", 8780228920))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
 # Ensure the data directory exists
 os.makedirs("data", exist_ok=True)
 
-# Save SQLite database inside the volume folder
+# Save SQLite database inside the persistent volume folder
 conn = sqlite3.connect("data/subscribers.db", check_same_thread=False)
 cursor = conn.cursor()
+
+# Create users table
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -31,6 +33,7 @@ cursor.execute("""
 conn.commit()
 
 def register_or_update_user(user_id: int, username: str, first_name: str):
+    user_id = int(user_id)
     role = "owner" if user_id == OWNER_ID else "user"
     cursor.execute("""
         INSERT INTO users (user_id, username, first_name, role)
@@ -43,6 +46,7 @@ def register_or_update_user(user_id: int, username: str, first_name: str):
     conn.commit()
 
 def get_user_role(user_id: int) -> str:
+    user_id = int(user_id)
     if user_id == OWNER_ID:
         return "owner"
     cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
@@ -57,7 +61,7 @@ def get_all_users():
     return cursor.fetchall()
 
 def set_user_role(user_id: int, role: str):
-    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, int(user_id)))
     conn.commit()
 
 # --- TIMETABLE & BELL SCHEDULE (10-B Aniq) ---
@@ -201,12 +205,17 @@ async def cmd_schedule(message: types.Message):
 # --- ADMIN & OWNER CONTROL COMMANDS ---
 @dp.message(Command("users"))
 async def cmd_list_users(message: types.Message):
+    register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    
     if not is_admin_or_owner(message.from_user.id):
+        await message.answer(f"⛔ **Siz admin emassiz.** (ID: `{message.from_user.id}`)", parse_mode="Markdown")
         return
+
     users = get_all_users()
     if not users:
         await message.answer("👥 Hozircha foydalanuvchilar yo'q.")
         return
+
     text = "👥 **Foydalanuvchilar Ro'yxati:**\n\n"
     for u_id, uname, fname, role in users:
         text += f"• **{fname}** (@{uname}) | ID: `{u_id}` | Role: `{role}`\n"
@@ -214,12 +223,17 @@ async def cmd_list_users(message: types.Message):
 
 @dp.message(Command("dm"))
 async def cmd_direct_message(message: types.Message):
+    register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    
     if not is_admin_or_owner(message.from_user.id):
+        await message.answer("⛔ Faqat adminlar foydalana oladi.", parse_mode="Markdown")
         return
+
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
         await message.answer("⚠️ **Ishlatish:** `/dm <user_id> <xabar>`", parse_mode="Markdown")
         return
+
     try:
         target_id = int(args[1])
         msg_text = args[2]
@@ -230,25 +244,34 @@ async def cmd_direct_message(message: types.Message):
 
 @dp.message(Command("makeadmin"))
 async def cmd_make_admin(message: types.Message):
+    register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    
     if get_user_role(message.from_user.id) != "owner":
         await message.answer("❌ Faqat **Owner** admin tayinlashi mumkin!", parse_mode="Markdown")
         return
+
     args = message.text.split()
     if len(args) < 2:
         await message.answer("⚠️ **Ishlatish:** `/makeadmin <user_id>`", parse_mode="Markdown")
         return
+
     target_id = int(args[1])
     set_user_role(target_id, "admin")
     await message.answer(f"👑 `{target_id}` foydalanuvchisi **Admin** qilindi!", parse_mode="Markdown")
 
 @dp.message(Command("removeadmin"))
 async def cmd_remove_admin(message: types.Message):
+    register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    
     if get_user_role(message.from_user.id) != "owner":
+        await message.answer("❌ Faqat **Owner** adminlikni olib tashlashi mumkin!", parse_mode="Markdown")
         return
+
     args = message.text.split()
     if len(args) < 2:
         await message.answer("⚠️ **Ishlatish:** `/removeadmin <user_id>`", parse_mode="Markdown")
         return
+
     target_id = int(args[1])
     set_user_role(target_id, "user")
     await message.answer(f"👤 `{target_id}` foydalanuvchisidan adminlik olindi.", parse_mode="Markdown")
@@ -258,7 +281,7 @@ async def send_morning_alert():
     now = datetime.now(UZB_TZ)
     weekday = now.weekday()
     if weekday in TIMETABLE:
-        msg = f"☀️ **Xayrli kun! Darslar boshlanishiga 1 soat qoldi.**\n\n" + format_day_schedule(weekday)
+        msg = f"☀️️ **Xayrli kun! Darslar boshlanishiga 1 soat qoldi.**\n\n" + format_day_schedule(weekday)
         await broadcast_message(msg)
 
 async def send_lesson_end_alert(lesson_num: int):
