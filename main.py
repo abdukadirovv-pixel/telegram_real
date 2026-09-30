@@ -14,7 +14,18 @@ from aiogram.types import ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAGExJbbmdJYYqY322UEHiarYmbgfx2SUIg")
+# Optional: load variables from a local .env file (pip install python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# The token is NEVER stored in the code. Set it as an environment variable (BOT_TOKEN).
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN is not set. Add it as an environment variable (see README / host settings).")
+
 OWNER_ID = int(os.getenv("OWNER_ID", 8780228920))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
