@@ -202,13 +202,12 @@ async def cmd_schedule(message: types.Message):
     text = format_day_schedule(target_day)
     await message.answer(text, parse_mode="Markdown")
 
-# --- ADMIN & OWNER CONTROL COMMANDS ---
 @dp.message(Command("users"))
 async def cmd_list_users(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     
     if not is_admin_or_owner(message.from_user.id):
-        await message.answer(f"⛔ **Siz admin emassiz.** (ID: `{message.from_user.id}`)", parse_mode="Markdown")
+        await message.answer(f"⛔ <b>Siz admin emassiz.</b> (ID: <code>{message.from_user.id}</code>)", parse_mode="HTML")
         return
 
     users = get_all_users()
@@ -216,10 +215,12 @@ async def cmd_list_users(message: types.Message):
         await message.answer("👥 Hozircha foydalanuvchilar yo'q.")
         return
 
-    text = "👥 **Foydalanuvchilar Ro'yxati:**\n\n"
+    text = "👥 <b>Foydalanuvchilar Ro'yxati:</b>\n\n"
     for u_id, uname, fname, role in users:
-        text += f"• **{fname}** (@{uname}) | ID: `{u_id}` | Role: `{role}`\n"
-    await message.answer(text, parse_mode="Markdown")
+        uname_str = f"@{uname}" if uname else "NoUsername"
+        text += f"• <b>{fname}</b> ({uname_str}) | ID: <code>{u_id}</code> | Role: <code>{role}</code>\n"
+        
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("dm"))
 async def cmd_direct_message(message: types.Message):
