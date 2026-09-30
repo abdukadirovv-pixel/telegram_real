@@ -202,25 +202,31 @@ async def cmd_schedule(message: types.Message):
     text = format_day_schedule(target_day)
     await message.answer(text, parse_mode="Markdown")
 
+import html
+
 @dp.message(Command("users"))
 async def cmd_list_users(message: types.Message):
-    register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    
-    if not is_admin_or_owner(message.from_user.id):
-        await message.answer(f"⛔ <b>Siz admin emassiz.</b> (ID: <code>{message.from_user.id}</code>)", parse_mode="HTML")
-        return
-
-    users = get_all_users()
-    if not users:
-        await message.answer("👥 Hozircha foydalanuvchilar yo'q.")
-        return
-
-    text = "👥 <b>Foydalanuvchilar Ro'yxati:</b>\n\n"
-    for u_id, uname, fname, role in users:
-        uname_str = f"@{uname}" if uname else "NoUsername"
-        text += f"• <b>{fname}</b> ({uname_str}) | ID: <code>{u_id}</code> | Role: <code>{role}</code>\n"
+    try:
+        register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
         
-    await message.answer(text, parse_mode="HTML")
+        if not is_admin_or_owner(message.from_user.id):
+            await message.answer(f"⛔ <b>Siz admin emassiz.</b> (ID: <code>{message.from_user.id}</code>)", parse_mode="HTML")
+            return
+
+        users = get_all_users()
+        if not users:
+            await message.answer("👥 Hozircha foydalanuvchilar yo'q.")
+            return
+
+        text = "👥 <b>Foydalanuvchilar Ro'yxati:</b>\n\n"
+        for u_id, uname, fname, role in users:
+            clean_name = html.escape(fname) if fname else "NoName"
+            clean_uname = f"@{html.escape(uname)}" if uname else "NoUsername"
+            text += f"• <b>{clean_name}</b> ({clean_uname}) | ID: <code>{u_id}</code> | Role: <code>{role}</code>\n"
+            
+        await message.answer(text, parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"⚠️ <b>Xatolik yuz berdi:</b>\n<code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 @dp.message(Command("dm"))
 async def cmd_direct_message(message: types.Message):
