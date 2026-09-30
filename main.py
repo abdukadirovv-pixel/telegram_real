@@ -14,7 +14,7 @@ from aiogram.types import ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAHU1fyYZ3mnPRuOXO35Onp2-QF6tLnntAg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAGExJbbmdJYYqY322UEHiarYmbgfx2SUIg")
 OWNER_ID = int(os.getenv("OWNER_ID", 8780228920))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
