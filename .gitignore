@@ -2,3 +2,5 @@ venv/
 __pycache__/
 *.db
 .env
+data/
+subscribers.db

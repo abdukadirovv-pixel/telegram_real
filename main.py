@@ -14,10 +14,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAHMqMozxrl-qYsbkG_RKOPrwRSH512gN
 OWNER_ID = int(os.getenv("OWNER_ID", "8780228920"))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
-# --- DATABASE SETUP ---
-conn = sqlite3.connect("subscribers.db", check_same_thread=False)
-cursor = conn.cursor()
+# Ensure the data directory exists
+os.makedirs("data", exist_ok=True)
 
+# Save SQLite database inside the volume folder
+conn = sqlite3.connect("data/subscribers.db", check_same_thread=False)
+cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
