@@ -13,7 +13,7 @@ from aiogram.types import ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
  
 # --- CONFIGURATION ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAHMqMozxrl-qYsbkG_RKOPrwRSH512gNT8")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8741655203:AAHU1fyYZ3mnPRuOXO35Onp2-QF6tLnntAg")
 OWNER_ID = int(os.getenv("OWNER_ID", 8780228920))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
  
