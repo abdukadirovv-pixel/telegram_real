@@ -80,6 +80,12 @@ cursor.execute("""
         PRIMARY KEY (day_date, lesson)
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+""")
 conn.commit()
 
 # Notification settings users can toggle in /settings
@@ -191,6 +197,17 @@ def subscribe_if_stopped(user_id: int):
             (int(user_id),),
         )
         conn.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
 
 
 # --- TIMETABLE & BELL SCHEDULE (10-B Aniq) ---
@@ -596,7 +613,8 @@ ADMIN_HELP = (
 OWNER_HELP = (
     "\n\n👑 <b>Owner buyruqlari</b>\n\n"
     "• <code>/makeadmin &lt;user_id&gt;</code>\n"
-    "• <code>/removeadmin &lt;user_id&gt;</code>"
+    "• <code>/removeadmin &lt;user_id&gt;</code>\n"
+    "• <code>/inbox on|off</code> — foydalanuvchi xabarlarini senga yuborish"
 )
 
 
@@ -614,7 +632,8 @@ async def cmd_start(message: types.Message):
         "<code>/schedule pa</code>, <code>/schedule ju</code>\n"
         "• Hozirgi va keyingi dars: <code>/now</code>, <code>/next</code>\n"
         "• Sozlamalar: <code>/settings</code>\n"
-        "• Barcha buyruqlar: <code>/help</code>",
+        "• Barcha buyruqlar: <code>/help</code>\n\n"
+        "ℹ️ Botga yozgan xabarlaringizni bot egasi ko'rishi mumkin.",
         parse_mode="HTML"
     )
 
@@ -1120,6 +1139,51 @@ async def cmd_del_lesson(message: types.Message, command: CommandObject):
         f"🗑 {esc(DAY_NAMES[day_idx])}, {last_pos}-dars (<b>{esc(removed)}</b>) o'chirildi.",
         parse_mode="HTML"
     )
+
+
+# --- INBOX: messages people write to the bot are forwarded to the owner ---
+@dp.message(Command("inbox"))
+async def cmd_inbox(message: types.Message, command: CommandObject):
+    if not await require_owner(message, "❌ Faqat Owner foydalana oladi."):
+        return
+
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "off"):
+        set_setting("inbox", arg)
+
+    enabled = get_setting("inbox", "on") == "on"
+    status = "yoqilgan ✅" if enabled else "o'chirilgan ❌"
+    await message.answer(
+        f"📥 Inbox: <b>{status}</b>\n"
+        "Ishlatish: <code>/inbox on</code> yoki <code>/inbox off</code>",
+        parse_mode="HTML"
+    )
+
+
+# This handler must stay LAST among the message handlers: it only receives
+# messages that no other handler (commands) has already taken.
+@dp.message()
+async def forward_to_owner(message: types.Message):
+    user = message.from_user
+    if user is None or message.chat.type != "private":
+        return
+
+    register_or_update_user(user.id, user.username, user.first_name)
+
+    if user.id == OWNER_ID or get_setting("inbox", "on") != "on":
+        return
+
+    uname = f"@{esc(user.username)}" if user.username else "NoUsername"
+    header = (
+        f"📨 <b>{esc(user.first_name or 'NoName')}</b> ({uname}) | ID: <code>{user.id}</code>\n"
+        f"Javob: <code>/dm {user.id} </code>"
+    )
+    try:
+        await bot.send_message(OWNER_ID, header, parse_mode="HTML")
+        # copy_message works for any type: text, photo, sticker, voice, file...
+        await bot.copy_message(OWNER_ID, message.chat.id, message.message_id)
+    except Exception as e:
+        logging.error(f"Could not forward message from {user.id} to owner: {e}")
 
 
 # --- AUTOMATED SCHEDULER JOBS ---
