@@ -1,3 +1,4 @@
+from aiohttp import web
 import os
 import html
 import math
@@ -1666,14 +1667,34 @@ def setup_scheduler() -> AsyncIOScheduler:
             )
 
     return scheduler
+import os
+import asyncio
+import logging
+from aiohttp import web
 
+async def handle_ping(request):
+    return web.Response(text="Bot is online!")
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    # 1. Web server setup for Render port check
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    # Render injects the PORT environment variable automatically
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web ping server started on port {port}")
+
+    # 2. Scheduler and Bot Polling
     scheduler = setup_scheduler()
     scheduler.start()
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
