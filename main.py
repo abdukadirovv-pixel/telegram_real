@@ -1,4 +1,3 @@
-from aiohttp import web
 import os
 import html
 import math
@@ -12,6 +11,7 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup
+from aiohttp import web  # already installed together with aiogram
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- CONFIGURATION ---
@@ -1667,34 +1667,42 @@ def setup_scheduler() -> AsyncIOScheduler:
             )
 
     return scheduler
-import os
-import asyncio
-import logging
-from aiohttp import web
 
-async def handle_ping(request):
-    return web.Response(text="Bot is online!")
 
-async def main():
-    # 1. Web server setup for Render port check
+# --- HEALTH WEB SERVER (needed by hosts that run the bot as a "Web Service", e.g. Render) ---
+async def start_health_server():
+    """Opens the port the host gives us in the PORT variable and answers 'OK'.
+    The bot itself still uses polling. Does nothing when PORT is not set (e.g. on your PC)."""
+    port = os.getenv("PORT")
+    if not port:
+        return None
+
+    async def handle(request):
+        return web.Response(text="Bot is running ✅")
+
     app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
 
     runner = web.AppRunner(app)
     await runner.setup()
-
-    # Render injects the PORT environment variable automatically
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", int(port))
     await site.start()
-    logging.info(f"Web ping server started on port {port}")
+    logging.info(f"Health server is listening on port {port}")
+    return runner
 
-    # 2. Scheduler and Bot Polling
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    runner = await start_health_server()
     scheduler = setup_scheduler()
     scheduler.start()
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if runner:
+            await runner.cleanup()
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
