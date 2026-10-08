@@ -60,24 +60,28 @@ ensure_column("users", "banned", "INTEGER DEFAULT 0")
 ensure_column("users", "morning_alert", "INTEGER DEFAULT 1")
 ensure_column("users", "lesson_alerts", "INTEGER DEFAULT 1")
 ensure_column("users", "announcements", "INTEGER DEFAULT 1")
+ensure_column("users", "class_id", "TEXT")
 
+# Every class has its OWN timetable and its OWN overrides (nothing is shared or merged)
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS timetable (
+    CREATE TABLE IF NOT EXISTS class_timetable (
+        class_id TEXT,
         day INTEGER,
         pos INTEGER,
         subject TEXT,
         room TEXT,
         teachers TEXT,
-        PRIMARY KEY (day, pos)
+        PRIMARY KEY (class_id, day, pos)
     )
 """)
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS overrides (
+    CREATE TABLE IF NOT EXISTS class_overrides (
+        class_id TEXT,
         day_date TEXT,
         lesson INTEGER,
         kind TEXT,
         note TEXT,
-        PRIMARY KEY (day_date, lesson)
+        PRIMARY KEY (class_id, day_date, lesson)
     )
 """)
 cursor.execute("""
@@ -103,102 +107,7 @@ def esc(value) -> str:
     return html.escape(str(value))
 
 
-# --- USER HELPERS ---
-def register_or_update_user(user_id: int, username: str, first_name: str):
-    user_id = int(user_id)
-    role = "owner" if user_id == OWNER_ID else "user"
-    cursor.execute("""
-        INSERT INTO users (user_id, username, first_name, role)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
-            is_active=1,
-            role=CASE WHEN user_id = ? THEN 'owner' ELSE users.role END
-    """, (user_id, username or "NoUsername", first_name or "User", role, OWNER_ID))
-    conn.commit()
-
-
-def get_user_role(user_id: int) -> str:
-    user_id = int(user_id)
-    if user_id == OWNER_ID:
-        return "owner"
-    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return row[0] if row else "user"
-
-
-def is_admin_or_owner(user_id: int) -> bool:
-    return get_user_role(user_id) in ["owner", "admin"]
-
-
-def get_all_users():
-    cursor.execute("SELECT user_id, username, first_name, role, is_active, banned FROM users")
-    return cursor.fetchall()
-
-
-def set_user_role(user_id: int, role: str):
-    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, int(user_id)))
-    conn.commit()
-
-
-def user_exists(user_id: int) -> bool:
-    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (int(user_id),))
-    return cursor.fetchone() is not None
-
-
-def parse_id(raw) -> int | None:
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def is_banned(user_id: int) -> bool:
-    cursor.execute("SELECT banned FROM users WHERE user_id = ?", (int(user_id),))
-    row = cursor.fetchone()
-    return bool(row and row[0])
-
-
-def set_banned(user_id: int, value: bool):
-    cursor.execute("UPDATE users SET banned = ? WHERE user_id = ?", (1 if value else 0, int(user_id)))
-    conn.commit()
-
-
-def mark_inactive(user_id: int):
-    cursor.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (int(user_id),))
-    conn.commit()
-
-
-def get_recipients(flag: str | None = None) -> list[int]:
-    """Active, non-banned users. If flag is given, only those who have it switched on."""
-    query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
-    if flag in SETTING_LABELS:
-        query += f" AND {flag} = 1"
-    cursor.execute(query)
-    return [row[0] for row in cursor.fetchall()]
-
-
-def get_settings(user_id: int) -> dict:
-    cursor.execute(
-        "SELECT morning_alert, lesson_alerts, announcements FROM users WHERE user_id = ?",
-        (int(user_id),),
-    )
-    row = cursor.fetchone() or (1, 1, 1)
-    return dict(zip(SETTING_LABELS.keys(), row))
-
-
-def subscribe_if_stopped(user_id: int):
-    """/start turns alerts back on for someone who had used /stop."""
-    settings = get_settings(user_id)
-    if not any(settings.values()):
-        cursor.execute(
-            "UPDATE users SET morning_alert = 1, lesson_alerts = 1, announcements = 1 WHERE user_id = ?",
-            (int(user_id),),
-        )
-        conn.commit()
-
-
+# --- SETTINGS HELPERS ---
 def get_setting(key: str, default: str = "") -> str:
     cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
     row = cursor.fetchone()
@@ -210,7 +119,7 @@ def set_setting(key: str, value: str):
     conn.commit()
 
 
-# --- TIMETABLE & BELL SCHEDULE (10-B Aniq) ---
+# --- DAYS ---
 DAY_NAMES = {
     0: "Dushanba (Monday)",
     1: "Seshanba (Tuesday)",
@@ -227,9 +136,22 @@ DAY_CODE_MAP = {
     "5": 4, "ju": 4, "juma": 4, "fri": 4, "friday": 4,
 }
 
-# Default timetable. It is copied into the database the FIRST time the bot runs.
-# After that the database is the source of truth (edit it with /setlesson and /dellesson).
-DEFAULT_TIMETABLE = {
+# ======================================================================
+#  CLASSES  (add a new class = add one block here, nothing else changes)
+# ======================================================================
+
+# --- 10-B aniq (the original schedule, unchanged) ---
+BELLS_10B = [
+    {"lesson": 1, "start": "09:00", "end": "09:45"},
+    {"lesson": 2, "start": "09:50", "end": "10:35"},
+    {"lesson": 3, "start": "10:40", "end": "11:25"},
+    {"lesson": 4, "start": "11:30", "end": "12:15"},
+    {"lesson": 5, "start": "12:45", "end": "13:30"},
+    {"lesson": 6, "start": "13:35", "end": "14:20"},
+    {"lesson": 7, "start": "14:25", "end": "15:10"},
+]
+
+DEFAULT_TIMETABLE_10B = {
     0: [  # 1 - Dushanba
         {"subject": "Algebra", "room": "218", "teachers": "Umid, Muhammadsodiq"},
         {"subject": "Kelajak soati", "room": "204", "teachers": "Umarbek"},
@@ -274,44 +196,272 @@ DEFAULT_TIMETABLE = {
     ],
 }
 
-BELL_SCHEDULE = [
-    {"lesson": 1, "start": "09:00", "end": "09:45"},
-    {"lesson": 2, "start": "09:50", "end": "10:35"},
-    {"lesson": 3, "start": "10:40", "end": "11:25"},
-    {"lesson": 4, "start": "11:30", "end": "12:15"},
-    {"lesson": 5, "start": "12:45", "end": "13:30"},
-    {"lesson": 6, "start": "13:35", "end": "14:20"},
-    {"lesson": 7, "start": "14:25", "end": "15:10"},
+# --- 10-A aniq ---
+# Same bell times as 10-B for lessons 1-7. Monday has an 8th lesson, so it gets one
+# extra slot right after the 7th (5-minute break, 45-minute lesson, like the rest).
+BELLS_10A = [dict(b) for b in BELLS_10B] + [
+    {"lesson": 8, "start": "15:15", "end": "16:00"},
 ]
 
-# Live timetable used by the whole bot (loaded from the database)
-TIMETABLE: dict[int, list[dict]] = {}
+DEFAULT_TIMETABLE_10A = {
+    0: [  # 1 - Dushanba
+        {"subject": "Kelajak soati", "room": "207", "teachers": "Ollanazar"},
+        {"subject": "Ingliz tili", "room": "222", "teachers": "Inobat, Muzaffar"},
+        {"subject": "Ona tili", "room": "210", "teachers": "Barno"},
+        {"subject": "Algebra", "room": "215", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "Geometriya", "room": "214", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "CHQBT", "room": "N/A", "teachers": "To'lqin"},
+        {"subject": "Jismoniy tarbiya", "room": "Sport zal", "teachers": "Ulug'bek"},
+        {"subject": "Fizika", "room": "202", "teachers": "O'g'lijon, Bekzod"},
+    ],
+    1: [  # 2 - Seshanba
+        {"subject": "Rus tili", "room": "128", "teachers": "Gulzoda, Shoxista"},
+        {"subject": "Ingliz tili", "room": "222", "teachers": "Inobat, Muzaffar"},
+        {"subject": "Tarbiya", "room": "132", "teachers": "Azada"},
+        {"subject": "Fizika", "room": "202", "teachers": "O'g'lijon, Bekzod"},
+        {"subject": "Algebra", "room": "215", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "Informatika", "room": "Informatika", "teachers": "Xursand, Feruza"},
+    ],
+    2: [  # 3 - Chorshanba
+        {"subject": "Fizika", "room": "202", "teachers": "O'g'lijon, Bekzod"},
+        {"subject": "Ona tili", "room": "210", "teachers": "Barno"},
+        {"subject": "O'zbek tarix", "room": "112", "teachers": "Shoira"},
+        {"subject": "Algebra", "room": "215", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "Geometriya", "room": "214", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "Adabiyot", "room": "210", "teachers": "Barno"},
+    ],
+    3: [  # 4 - Payshanba
+        {"subject": "Fizika", "room": "202", "teachers": "O'g'lijon, Bekzod"},
+        {"subject": "Ingliz tili", "room": "222", "teachers": "Inobat, Muzaffar"},
+        {"subject": "Adabiyot", "room": "210", "teachers": "Barno"},
+        {"subject": "Informatika", "room": "Informatika", "teachers": "Xursand, Feruza"},
+        {"subject": "Jahon tarix", "room": "112", "teachers": "Shoira"},
+        {"subject": "CHQBT", "room": "129", "teachers": "To'lqin"},
+    ],
+    4: [  # 5 - Juma
+        {"subject": "Ingliz tili", "room": "222", "teachers": "Inobat, Muzaffar"},
+        {"subject": "O'zbek tarix", "room": "112", "teachers": "Shoira"},
+        {"subject": "Algebra", "room": "215", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "Geometriya", "room": "214", "teachers": "Gulnoza, Ollanazar"},
+        {"subject": "Rus tili", "room": "128", "teachers": "Gulzoda, Shoxista"},
+        {"subject": "Fizika", "room": "202", "teachers": "O'g'lijon, Bekzod"},
+    ],
+}
+
+# "morning" = time of the morning alert (1 hour before the first lesson starts)
+CLASSES = {
+    "10a": {
+        "name": "10-A aniq",
+        "short": "10-A",
+        "morning": "08:00",
+        "bells": BELLS_10A,
+        "default": DEFAULT_TIMETABLE_10A,
+    },
+    "10b": {
+        "name": "10-B aniq",
+        "short": "10-B",
+        "morning": "08:00",
+        "bells": BELLS_10B,
+        "default": DEFAULT_TIMETABLE_10B,
+    },
+}
+
+# Live timetables used by the whole bot: TIMETABLES[class_id][weekday] -> list of lessons
+TIMETABLES: dict[str, dict[int, list[dict]]] = {}
 
 
-def seed_timetable_if_empty():
-    cursor.execute("SELECT COUNT(*) FROM timetable")
+def table_exists(name: str) -> bool:
+    cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
+    return cursor.fetchone() is not None
+
+
+def migrate_to_multiclass():
+    """One-time: the old single-class data (10-B) becomes the data of class 10b,
+    and all existing users stay on 10-B so nothing changes for them."""
+    if get_setting("multiclass_migrated") == "1":
+        return
+    if table_exists("timetable"):
+        cursor.execute(
+            "INSERT OR IGNORE INTO class_timetable (class_id, day, pos, subject, room, teachers) "
+            "SELECT '10b', day, pos, subject, room, teachers FROM timetable"
+        )
+    if table_exists("overrides"):
+        cursor.execute(
+            "INSERT OR IGNORE INTO class_overrides (class_id, day_date, lesson, kind, note) "
+            "SELECT '10b', day_date, lesson, kind, note FROM overrides"
+        )
+    cursor.execute("UPDATE users SET class_id = '10b' WHERE class_id IS NULL")
+    conn.commit()
+    set_setting("multiclass_migrated", "1")
+
+
+def seed_class_if_needed(class_id: str):
+    """Copies the default timetable of a class into the database (only once per class)."""
+    if get_setting(f"seeded_{class_id}") == "1":
+        return
+    cursor.execute("SELECT COUNT(*) FROM class_timetable WHERE class_id = ?", (class_id,))
     if cursor.fetchone()[0] == 0:
-        for day, lessons in DEFAULT_TIMETABLE.items():
+        for day, lessons in CLASSES[class_id]["default"].items():
             for pos, item in enumerate(lessons, start=1):
                 cursor.execute(
-                    "INSERT INTO timetable (day, pos, subject, room, teachers) VALUES (?, ?, ?, ?, ?)",
-                    (day, pos, item["subject"], item["room"], item["teachers"]),
+                    "INSERT INTO class_timetable (class_id, day, pos, subject, room, teachers) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (class_id, day, pos, item["subject"], item["room"], item["teachers"]),
                 )
         conn.commit()
+    set_setting(f"seeded_{class_id}", "1")
 
 
 def load_timetable():
-    """Reloads TIMETABLE from the database (only days that have lessons)."""
-    cursor.execute("SELECT day, pos, subject, room, teachers FROM timetable ORDER BY day, pos")
-    fresh: dict[int, list[dict]] = {}
-    for day, _pos, subject, room, teachers in cursor.fetchall():
-        fresh.setdefault(day, []).append({"subject": subject, "room": room, "teachers": teachers})
-    TIMETABLE.clear()
-    TIMETABLE.update(fresh)
+    """Reloads TIMETABLES from the database (only days that have lessons)."""
+    fresh: dict[str, dict[int, list[dict]]] = {cid: {} for cid in CLASSES}
+    cursor.execute(
+        "SELECT class_id, day, pos, subject, room, teachers FROM class_timetable ORDER BY class_id, day, pos"
+    )
+    for class_id, day, _pos, subject, room, teachers in cursor.fetchall():
+        if class_id in fresh:
+            fresh[class_id].setdefault(day, []).append({"subject": subject, "room": room, "teachers": teachers})
+    TIMETABLES.clear()
+    TIMETABLES.update(fresh)
 
 
-seed_timetable_if_empty()
+migrate_to_multiclass()
+for _cid in CLASSES:
+    seed_class_if_needed(_cid)
 load_timetable()
+
+
+def class_bells(class_id: str) -> list[dict]:
+    return CLASSES[class_id]["bells"]
+
+
+def class_timetable(class_id: str) -> dict[int, list[dict]]:
+    return TIMETABLES.get(class_id, {})
+
+
+def class_name(class_id: str | None) -> str:
+    return CLASSES[class_id]["name"] if class_id in CLASSES else "—"
+
+
+def class_token(raw: str | None) -> str | None:
+    """'10a', '10-A', '10B' -> '10a' / '10b' (None if it is not a class code)."""
+    if not raw:
+        return None
+    token = raw.lower().replace("-", "")
+    return token if token in CLASSES else None
+
+
+# --- USER HELPERS ---
+def register_or_update_user(user_id: int, username: str, first_name: str):
+    user_id = int(user_id)
+    role = "owner" if user_id == OWNER_ID else "user"
+    cursor.execute("""
+        INSERT INTO users (user_id, username, first_name, role)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            is_active=1,
+            role=CASE WHEN user_id = ? THEN 'owner' ELSE users.role END
+    """, (user_id, username or "NoUsername", first_name or "User", role, OWNER_ID))
+    conn.commit()
+
+
+def get_user_role(user_id: int) -> str:
+    user_id = int(user_id)
+    if user_id == OWNER_ID:
+        return "owner"
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    return row[0] if row else "user"
+
+
+def is_admin_or_owner(user_id: int) -> bool:
+    return get_user_role(user_id) in ["owner", "admin"]
+
+
+def get_all_users():
+    cursor.execute("SELECT user_id, username, first_name, role, is_active, banned, class_id FROM users")
+    return cursor.fetchall()
+
+
+def set_user_role(user_id: int, role: str):
+    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, int(user_id)))
+    conn.commit()
+
+
+def user_exists(user_id: int) -> bool:
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (int(user_id),))
+    return cursor.fetchone() is not None
+
+
+def parse_id(raw) -> int | None:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_banned(user_id: int) -> bool:
+    cursor.execute("SELECT banned FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    return bool(row and row[0])
+
+
+def set_banned(user_id: int, value: bool):
+    cursor.execute("UPDATE users SET banned = ? WHERE user_id = ?", (1 if value else 0, int(user_id)))
+    conn.commit()
+
+
+def mark_inactive(user_id: int):
+    cursor.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (int(user_id),))
+    conn.commit()
+
+
+def get_user_class(user_id: int) -> str | None:
+    cursor.execute("SELECT class_id FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    class_id = row[0] if row else None
+    return class_id if class_id in CLASSES else None
+
+
+def set_user_class(user_id: int, class_id: str):
+    cursor.execute("UPDATE users SET class_id = ? WHERE user_id = ?", (class_id, int(user_id)))
+    conn.commit()
+
+
+def get_recipients(flag: str | None = None, class_id: str | None = None) -> list[int]:
+    """Active, non-banned users. Optionally only one class / only those with a setting switched on."""
+    query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
+    params: list = []
+    if flag in SETTING_LABELS:
+        query += f" AND {flag} = 1"
+    if class_id:
+        query += " AND class_id = ?"
+        params.append(class_id)
+    cursor.execute(query, params)
+    return [row[0] for row in cursor.fetchall()]
+
+
+def get_settings(user_id: int) -> dict:
+    cursor.execute(
+        "SELECT morning_alert, lesson_alerts, announcements FROM users WHERE user_id = ?",
+        (int(user_id),),
+    )
+    row = cursor.fetchone() or (1, 1, 1)
+    return dict(zip(SETTING_LABELS.keys(), row))
+
+
+def subscribe_if_stopped(user_id: int):
+    """/start turns alerts back on for someone who had used /stop."""
+    settings = get_settings(user_id)
+    if not any(settings.values()):
+        cursor.execute(
+            "UPDATE users SET morning_alert = 1, lesson_alerts = 1, announcements = 1 WHERE user_id = ?",
+            (int(user_id),),
+        )
+        conn.commit()
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -355,30 +505,31 @@ def week_start(today: date) -> date:
     return today - timedelta(days=wd) if wd < 5 else today + timedelta(days=7 - wd)
 
 
-def get_off_reason(d: date) -> str | None:
-    """Returns the reason if the day is marked 'no school', otherwise None."""
+def get_off_reason(class_id: str, d: date) -> str | None:
+    """Returns the reason if the day is marked 'no school' for this class, otherwise None."""
     cursor.execute(
-        "SELECT note FROM overrides WHERE day_date = ? AND lesson = 0 AND kind = 'off'",
-        (d.isoformat(),),
+        "SELECT note FROM class_overrides WHERE class_id = ? AND day_date = ? AND lesson = 0 AND kind = 'off'",
+        (class_id, d.isoformat()),
     )
     row = cursor.fetchone()
     return row[0] if row else None
 
 
-def get_notes(d: date) -> dict[int, str]:
+def get_notes(class_id: str, d: date) -> dict[int, str]:
     cursor.execute(
-        "SELECT lesson, note FROM overrides WHERE day_date = ? AND kind = 'note'",
-        (d.isoformat(),),
+        "SELECT lesson, note FROM class_overrides WHERE class_id = ? AND day_date = ? AND kind = 'note'",
+        (class_id, d.isoformat()),
     )
     return {lesson: note for lesson, note in cursor.fetchall()}
 
 
-def effective_lessons(d: date) -> list[dict]:
-    """Lessons that really take place on a date (no lessons on weekends/holidays)."""
+def effective_lessons(class_id: str, d: date) -> list[dict]:
+    """Lessons that really take place for a class on a date (none on weekends/holidays)."""
+    timetable = class_timetable(class_id)
     wd = d.weekday()
-    if wd not in TIMETABLE or get_off_reason(d) is not None:
+    if wd not in timetable or get_off_reason(class_id, d) is not None:
         return []
-    return TIMETABLE[wd][:len(BELL_SCHEDULE)]
+    return timetable[wd][:len(class_bells(class_id))]
 
 
 def lesson_dt(d: date, hm: str) -> datetime:
@@ -403,27 +554,30 @@ def day_label(d: date, today: date) -> str:
 
 
 # --- FORMATTING ---
-def format_date_schedule(d: date) -> str:
+def format_date_schedule(class_id: str, d: date) -> str:
+    timetable = class_timetable(class_id)
+    bells = class_bells(class_id)
     wd = d.weekday()
     label = d.strftime("%d.%m.%Y")
+    cname = esc(class_name(class_id))
 
-    if wd not in TIMETABLE:
+    if wd not in timetable:
         return f"🎉 <b>Dam olish kuni! Darslar yo'q.</b> ({label})"
 
     day_title = DAY_NAMES.get(wd, "Dars Jadvali")
-    off = get_off_reason(d)
+    off = get_off_reason(class_id, d)
     if off is not None:
-        text = f"🎉 <b>{esc(day_title)} ({label}) — dars yo'q.</b>"
+        text = f"🎉 <b>{esc(day_title)} ({label}) — dars yo'q.</b> · {cname}"
         if off:
             text += f"\n{esc(off)}"
         return text
 
-    lessons = TIMETABLE[wd][:len(BELL_SCHEDULE)]
-    notes = get_notes(d)
-    text = f"📅 <b>Dars Jadvali: {esc(day_title)}</b> ({label})\n\n"
+    lessons = timetable[wd][:len(bells)]
+    notes = get_notes(class_id, d)
+    text = f"📅 <b>Dars Jadvali: {esc(day_title)}</b> ({label}) · {cname}\n\n"
 
     for idx, item in enumerate(lessons):
-        bell = BELL_SCHEDULE[idx]
+        bell = bells[idx]
         room_str = f"| 🚪 Xona: {esc(item['room'])}" if item.get("room") else ""
         text += f"<b>{bell['lesson']}-dars ({bell['start']} - {bell['end']}):</b> {esc(item['subject'])}\n"
         text += f"└ 👨‍🏫 <i>O'qituvchi:</i> {esc(item['teachers'])} {room_str}\n"
@@ -434,18 +588,20 @@ def format_date_schedule(d: date) -> str:
     return text
 
 
-def format_week(start: date) -> str:
-    text = "🗓 <b>Haftalik jadval</b>\n\n"
+def format_week(class_id: str, start: date) -> str:
+    timetable = class_timetable(class_id)
+    bells = class_bells(class_id)
+    text = f"🗓 <b>Haftalik jadval</b> · {esc(class_name(class_id))}\n\n"
     for wd in range(5):
         d = start + timedelta(days=wd)
         text += f"<b>{esc(DAY_NAMES[wd])}</b> ({d.strftime('%d.%m')})"
-        off = get_off_reason(d)
+        off = get_off_reason(class_id, d)
         if off is not None:
             text += " — 🎉 dars yo'q\n\n"
             continue
         text += "\n"
-        notes = get_notes(d)
-        for idx, item in enumerate(TIMETABLE.get(wd, [])[:len(BELL_SCHEDULE)]):
+        notes = get_notes(class_id, d)
+        for idx, item in enumerate(timetable.get(wd, [])[:len(bells)]):
             mark = " ⚠️" if (idx + 1) in notes else ""
             text += f"{idx + 1}. {esc(item['subject'])} ({esc(item['room'])}){mark}\n"
         text += "\n"
@@ -467,11 +623,48 @@ def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def class_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"🏫 {cfg['name']}", callback_data=f"cls:{cid}")]
+        for cid, cfg in CLASSES.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+CLASS_PROMPT = (
+    "🏫 <b>Sinfingizni tanlang:</b>\n"
+    "Tanlaganingizdan keyin shu sinfning jadvali va xabarlarini olasiz.\n"
+    "(Keyinroq o'zgartirish: /class)"
+)
+
+NEED_CLASS = (
+    "⚠️ Sinfni ko'rsating: <code>10a</code> yoki <code>10b</code> "
+    "(yoki /class orqali o'z sinfingizni tanlang)."
+)
+
+
+def welcome_text(class_id: str) -> str:
+    return (
+        "👋 <b>Xush kelibsiz!</b> Bot sizni eslab qoldi.\n"
+        f"🏫 Sinfingiz: <b>{esc(class_name(class_id))}</b> (o'zgartirish: /class)\n\n"
+        "✅ <b>Endi har kuni darslar va dars tugashi haqida avtomatik xabarlar olasiz!</b>\n\n"
+        "• Bugungi jadval: <code>/schedule</code>\n"
+        "• Kunlar bo'yicha: <code>/schedule 1</code> (Dushanba) dan <code>/schedule 5</code> (Juma) gacha\n"
+        "• Qisqa kodlar: <code>/schedule du</code>, <code>/schedule se</code>, <code>/schedule ch</code>, "
+        "<code>/schedule pa</code>, <code>/schedule ju</code>\n"
+        "• Hozirgi va keyingi dars: <code>/now</code>, <code>/next</code>\n"
+        "• Sozlamalar: <code>/settings</code>\n"
+        "• Barcha buyruqlar: <code>/help</code>\n\n"
+        "ℹ️ Botga yozgan xabarlaringizni bot egasi ko'rishi mumkin."
+    )
+
+
 # --- /now and /next LOGIC ---
-def find_current(now: datetime):
-    lessons = effective_lessons(now.date())
+def find_current(class_id: str, now: datetime):
+    bells = class_bells(class_id)
+    lessons = effective_lessons(class_id, now.date())
     for idx, item in enumerate(lessons):
-        bell = BELL_SCHEDULE[idx]
+        bell = bells[idx]
         start = lesson_dt(now.date(), bell["start"])
         end = lesson_dt(now.date(), bell["end"])
         if start <= now < end:
@@ -479,24 +672,25 @@ def find_current(now: datetime):
     return None
 
 
-def find_next(now: datetime):
+def find_next(class_id: str, now: datetime):
+    bells = class_bells(class_id)
     for offset in range(0, 8):
         d = now.date() + timedelta(days=offset)
-        for idx, item in enumerate(effective_lessons(d)):
-            start = lesson_dt(d, BELL_SCHEDULE[idx]["start"])
+        for idx, item in enumerate(effective_lessons(class_id, d)):
+            start = lesson_dt(d, bells[idx]["start"])
             if start > now:
                 return d, idx, item, start
     return None
 
 
-def next_lesson_text(now: datetime) -> str:
-    nxt = find_next(now)
+def next_lesson_text(class_id: str, now: datetime) -> str:
+    nxt = find_next(class_id, now)
     if not nxt:
         return "ℹ️ Yaqin kunlarda dars topilmadi."
 
     d, idx, item, start = nxt
-    bell = BELL_SCHEDULE[idx]
-    note = get_notes(d).get(bell["lesson"])
+    bell = class_bells(class_id)[idx]
+    note = get_notes(class_id, d).get(bell["lesson"])
 
     text = (
         f"➡️ <b>Keyingi dars:</b> {bell['lesson']}-dars — {esc(item['subject'])}\n"
@@ -542,16 +736,16 @@ async def safe_send(user_id: int, text: str, parse_mode: str = "HTML") -> str:
     return "failed"
 
 
-async def broadcast_message(text: str, flag: str | None = None) -> dict:
+async def broadcast_message(text: str, flag: str | None = None, class_id: str | None = None) -> dict:
     result = {"ok": 0, "blocked": 0, "failed": 0}
-    for u_id in get_recipients(flag):
+    for u_id in get_recipients(flag, class_id):
         status = await safe_send(u_id, text)
         result[status] += 1
         await asyncio.sleep(0.05)  # stay under Telegram rate limits
     return result
 
 
-# --- PERMISSION HELPERS ---
+# --- PERMISSION / CLASS HELPERS ---
 async def require_admin(message: types.Message) -> bool:
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     if not is_admin_or_owner(message.from_user.id):
@@ -566,6 +760,33 @@ async def require_owner(message: types.Message, text: str) -> bool:
         await message.answer(text)
         return False
     return True
+
+
+async def ensure_class(message: types.Message) -> str | None:
+    """Returns the user's class, or shows the class buttons and returns None."""
+    class_id = get_user_class(message.from_user.id)
+    if class_id:
+        return class_id
+    await message.answer(CLASS_PROMPT, parse_mode="HTML", reply_markup=class_keyboard())
+    return None
+
+
+def resolve_scope(args: str | None, user_id: int, allow_all: bool = False):
+    """For admin commands. The first word may be a class code (10a / 10b) or 'all'.
+    Returns (list_of_class_ids or None, remaining_text). Without a code the admin's own class is used."""
+    text = (args or "").strip()
+    parts = text.split(maxsplit=1)
+    rest = parts[1] if len(parts) > 1 else ""
+    if parts:
+        first = class_token(parts[0])
+        if first:
+            return [first], rest
+        if allow_all and parts[0].lower() in ("all", "hamma"):
+            return list(CLASSES), rest
+    own = get_user_class(user_id)
+    if own:
+        return [own], text
+    return None, text
 
 
 async def safe_edit(call: types.CallbackQuery, text: str, markup: InlineKeyboardMarkup):
@@ -585,6 +806,7 @@ async def on_error(event: ErrorEvent):
 # --- HELP TEXTS ---
 USER_HELP = (
     "📖 <b>Buyruqlar</b>\n\n"
+    "• <code>/class</code> — sinfni tanlash / almashtirish\n"
     "• <code>/schedule</code> — bugungi jadval (<code>/schedule 1</code> … <code>/schedule 5</code>)\n"
     "• <code>/tomorrow</code> — ertangi jadval\n"
     "• <code>/week</code> — haftalik jadval\n"
@@ -599,14 +821,16 @@ ADMIN_HELP = (
     "• <code>/users</code> — foydalanuvchilar ro'yxati\n"
     "• <code>/stats</code> — statistika\n"
     "• <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code>\n"
-    "• <code>/broadcast &lt;xabar&gt;</code>\n"
+    "• <code>/broadcast [sinf] &lt;xabar&gt;</code> — sinf yozilmasa hammaga\n"
     "• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>\n"
-    "• <code>/holiday &lt;sana&gt; [sabab]</code> — dars yo'q kuni\n"
-    "• <code>/change &lt;sana&gt; &lt;dars#&gt; &lt;matn&gt;</code> — darsga eslatma\n"
-    "• <code>/changes</code> — o'zgarishlar ro'yxati\n"
-    "• <code>/clearchange &lt;sana&gt;</code> — o'zgarishlarni o'chirish\n"
-    "• <code>/setlesson &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
-    "• <code>/dellesson &lt;kun&gt;</code> — kunning oxirgi darsini o'chirish\n"
+    "• <code>/setclass &lt;user_id&gt; &lt;sinf&gt;</code> — foydalanuvchi sinfini o'zgartirish\n"
+    "• <code>/holiday [sinf|all] &lt;sana&gt; [sabab]</code> — dars yo'q kuni\n"
+    "• <code>/change [sinf] &lt;sana&gt; &lt;dars#&gt; &lt;matn&gt;</code> — darsga eslatma\n"
+    "• <code>/changes [sinf|all]</code> — o'zgarishlar ro'yxati\n"
+    "• <code>/clearchange [sinf|all] &lt;sana&gt;</code> — o'zgarishlarni o'chirish\n"
+    "• <code>/setlesson [sinf] &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
+    "• <code>/dellesson [sinf] &lt;kun&gt;</code> — kunning oxirgi darsini o'chirish\n"
+    "Sinf: <code>10a</code> yoki <code>10b</code> (yozilmasa — o'z sinfingiz).\n"
     "Sana: <code>YYYY-MM-DD</code>, <code>bugun</code> yoki <code>ertaga</code>"
 )
 
@@ -623,19 +847,25 @@ OWNER_HELP = (
 async def cmd_start(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     subscribe_if_stopped(message.from_user.id)
-    await message.answer(
-        "👋 <b>Xush kelibsiz!</b> Bot sizni eslab qoldi.\n\n"
-        "✅ <b>Endi har kuni darslar va dars tugashi haqida avtomatik xabarlar olasiz!</b>\n\n"
-        "• Bugungi jadval: <code>/schedule</code>\n"
-        "• Kunlar bo'yicha: <code>/schedule 1</code> (Dushanba) dan <code>/schedule 5</code> (Juma) gacha\n"
-        "• Qisqa kodlar: <code>/schedule du</code>, <code>/schedule se</code>, <code>/schedule ch</code>, "
-        "<code>/schedule pa</code>, <code>/schedule ju</code>\n"
-        "• Hozirgi va keyingi dars: <code>/now</code>, <code>/next</code>\n"
-        "• Sozlamalar: <code>/settings</code>\n"
-        "• Barcha buyruqlar: <code>/help</code>\n\n"
-        "ℹ️ Botga yozgan xabarlaringizni bot egasi ko'rishi mumkin.",
-        parse_mode="HTML"
-    )
+
+    class_id = get_user_class(message.from_user.id)
+    if not class_id:
+        await message.answer(
+            "👋 <b>Xush kelibsiz!</b>\n\n" + CLASS_PROMPT,
+            parse_mode="HTML",
+            reply_markup=class_keyboard(),
+        )
+        return
+
+    await message.answer(welcome_text(class_id), parse_mode="HTML")
+
+
+@dp.message(Command("class"))
+async def cmd_class(message: types.Message):
+    register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    class_id = get_user_class(message.from_user.id)
+    current = f"Hozirgi sinf: <b>{esc(class_name(class_id))}</b>\n\n" if class_id else ""
+    await message.answer(current + CLASS_PROMPT, parse_mode="HTML", reply_markup=class_keyboard())
 
 
 @dp.message(Command("help"))
@@ -652,6 +882,10 @@ async def cmd_help(message: types.Message):
 @dp.message(Command("schedule", "timetable"))
 async def cmd_schedule(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    class_id = await ensure_class(message)
+    if not class_id:
+        return
+
     args = message.text.split()
     today = datetime.now(UZB_TZ).date()
 
@@ -673,32 +907,44 @@ async def cmd_schedule(message: types.Message):
     else:
         target = today
 
-    await message.answer(format_date_schedule(target), parse_mode="HTML", reply_markup=day_keyboard())
+    await message.answer(format_date_schedule(class_id, target), parse_mode="HTML", reply_markup=day_keyboard())
 
 
 @dp.message(Command("tomorrow"))
 async def cmd_tomorrow(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    class_id = await ensure_class(message)
+    if not class_id:
+        return
+
     target = datetime.now(UZB_TZ).date() + timedelta(days=1)
-    await message.answer(format_date_schedule(target), parse_mode="HTML", reply_markup=day_keyboard())
+    await message.answer(format_date_schedule(class_id, target), parse_mode="HTML", reply_markup=day_keyboard())
 
 
 @dp.message(Command("week"))
 async def cmd_week(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    class_id = await ensure_class(message)
+    if not class_id:
+        return
+
     start = week_start(datetime.now(UZB_TZ).date())
-    await message.answer(format_week(start), parse_mode="HTML")
+    await message.answer(format_week(class_id, start), parse_mode="HTML")
 
 
 @dp.message(Command("now"))
 async def cmd_now(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    class_id = await ensure_class(message)
+    if not class_id:
+        return
+
     now = datetime.now(UZB_TZ)
-    current = find_current(now)
+    current = find_current(class_id, now)
 
     if current:
         idx, item, end = current
-        bell = BELL_SCHEDULE[idx]
+        bell = class_bells(class_id)[idx]
         left = math.ceil((end - now).total_seconds() / 60)
         text = (
             f"📍 <b>Hozir:</b> {bell['lesson']}-dars — {esc(item['subject'])}\n"
@@ -709,14 +955,18 @@ async def cmd_now(message: types.Message):
     else:
         text = "☕ <b>Hozir dars yo'q.</b>\n\n"
 
-    text += next_lesson_text(now)
+    text += next_lesson_text(class_id, now)
     await message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message):
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    await message.answer(next_lesson_text(datetime.now(UZB_TZ)), parse_mode="HTML")
+    class_id = await ensure_class(message)
+    if not class_id:
+        return
+
+    await message.answer(next_lesson_text(class_id, datetime.now(UZB_TZ)), parse_mode="HTML")
 
 
 @dp.message(Command("settings"))
@@ -744,9 +994,31 @@ async def cmd_stop(message: types.Message):
 
 
 # --- INLINE BUTTON CALLBACKS ---
+@dp.callback_query(F.data.startswith("cls:"))
+async def cb_class(call: types.CallbackQuery):
+    class_id = call.data.split(":", 1)[1]
+    if class_id not in CLASSES:
+        await call.answer()
+        return
+
+    register_or_update_user(call.from_user.id, call.from_user.username, call.from_user.first_name)
+    set_user_class(call.from_user.id, class_id)
+
+    try:
+        await call.message.edit_text(welcome_text(class_id), parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+    await call.answer(f"{CLASSES[class_id]['name']} ✅")
+
+
 @dp.callback_query(F.data.startswith("day:"))
 async def cb_day(call: types.CallbackQuery):
     register_or_update_user(call.from_user.id, call.from_user.username, call.from_user.first_name)
+    class_id = get_user_class(call.from_user.id)
+    if not class_id:
+        await call.answer("Avval sinfni tanlang: /class", show_alert=True)
+        return
+
     key = call.data.split(":", 1)[1]
     today = datetime.now(UZB_TZ).date()
 
@@ -758,7 +1030,7 @@ async def cb_day(call: types.CallbackQuery):
         await call.answer()
         return
 
-    await safe_edit(call, format_date_schedule(target), day_keyboard())
+    await safe_edit(call, format_date_schedule(class_id, target), day_keyboard())
     await call.answer()
 
 
@@ -792,12 +1064,15 @@ async def cmd_list_users(message: types.Message):
         return
 
     lines = ["👥 <b>Foydalanuvchilar Ro'yxati:</b>\n"]
-    for u_id, uname, fname, role, is_active, banned in users:
+    for u_id, uname, fname, role, is_active, banned, class_id in users:
         name = esc(fname or "NoName")
         un = f"@{esc(uname)}" if uname and uname != "NoUsername" else "NoUsername"
         flags = (" 🚫" if banned else "") + (" 💤" if not is_active else "")
-        lines.append(f"• <b>{name}</b> ({un}) | ID: <code>{u_id}</code> | <code>{role}</code>{flags}")
-    lines.append("\n🚫 — ban qilingan, 💤 — botni bloklagan")
+        short = CLASSES[class_id]["short"] if class_id in CLASSES else "—"
+        lines.append(
+            f"• <b>{name}</b> ({un}) | ID: <code>{u_id}</code> | 🏫 {short} | <code>{role}</code>{flags}"
+        )
+    lines.append("\n🚫 — ban qilingan, 💤 — botni bloklagan, — — sinf tanlanmagan")
     text = "\n".join(lines)
 
     # Telegram limit is 4096 chars per message
@@ -823,6 +1098,13 @@ async def cmd_stats(message: types.Message):
     lessons = count("is_active = 1 AND banned = 0 AND lesson_alerts = 1")
     announce = count("is_active = 1 AND banned = 0 AND announcements = 1")
 
+    cursor.execute("SELECT class_id, COUNT(*) FROM users WHERE is_active = 1 AND banned = 0 GROUP BY class_id")
+    per_class = dict(cursor.fetchall())
+    class_lines = "".join(
+        f"• {esc(cfg['name'])}: <b>{per_class.get(cid, 0)}</b>\n" for cid, cfg in CLASSES.items()
+    )
+    class_lines += f"• Sinf tanlamagan: <b>{per_class.get(None, 0)}</b>\n"
+
     await message.answer(
         "📊 <b>Statistika</b>\n\n"
         f"👥 Jami foydalanuvchilar: <b>{total}</b>\n"
@@ -830,6 +1112,8 @@ async def cmd_stats(message: types.Message):
         f"💤 Botni bloklagan: <b>{inactive}</b>\n"
         f"🚫 Ban qilingan: <b>{banned}</b>\n"
         f"🛡 Adminlar (owner bilan): <b>{admins}</b>\n\n"
+        "🏫 <b>Faol foydalanuvchilar sinflar bo'yicha:</b>\n"
+        f"{class_lines}\n"
         f"☀️ Ertalabki xabar yoqilgan: <b>{morning}</b>\n"
         f"🔔 Dars tugashi xabari yoqilgan: <b>{lessons}</b>\n"
         f"📢 E'lonlar yoqilgan: <b>{announce}</b>\n\n"
@@ -867,17 +1151,29 @@ async def cmd_broadcast(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    if not command.args:
-        await message.answer("⚠️ Ishlatish: <code>/broadcast &lt;xabar&gt;</code>", parse_mode="HTML")
+    args = (command.args or "").strip()
+    parts = args.split(maxsplit=1)
+    target_class = class_token(parts[0]) if parts else None
+    body = (parts[1] if len(parts) > 1 else "") if target_class else args
+
+    if not body.strip():
+        await message.answer(
+            "⚠️ Ishlatish: <code>/broadcast [sinf] &lt;xabar&gt;</code>\n"
+            "Masalan: <code>/broadcast 10a Ertaga dars 10:00 da</code>",
+            parse_mode="HTML"
+        )
         return
 
-    text = f"📢 <b>E'lon:</b>\n\n{esc(command.args)}"
-    result = await broadcast_message(text, flag="announcements")
+    text = f"📢 <b>E'lon:</b>\n\n{esc(body)}"
+    result = await broadcast_message(text, flag="announcements", class_id=target_class)
 
+    target_label = class_name(target_class) if target_class else "Hammaga"
     await message.answer(
+        f"📢 {esc(target_label)}\n"
         f"✅ Yuborildi: {result['ok']}\n"
         f"🚫 Bloklagan: {result['blocked']}\n"
-        f"❌ Xatolik: {result['failed']}"
+        f"❌ Xatolik: {result['failed']}",
+        parse_mode="HTML"
     )
 
 
@@ -969,29 +1265,84 @@ async def cmd_unban(message: types.Message, command: CommandObject):
     await message.answer(f"✅ <code>{target_id}</code> ban dan chiqarildi.", parse_mode="HTML")
 
 
-# --- SCHEDULE CHANGES / HOLIDAYS (admin) ---
+@dp.message(Command("setclass"))
+async def cmd_set_class(message: types.Message, command: CommandObject):
+    """Admin/Owner: move one user to another class (or clear it so they must choose again)."""
+    if not await require_admin(message):
+        return
+
+    usage = (
+        "⚠️ Ishlatish: <code>/setclass &lt;user_id&gt; &lt;sinf&gt;</code>\n"
+        "Masalan: <code>/setclass 123456789 10a</code>\n"
+        "Sinfni tozalash (qaytadan tanlatish): <code>/setclass 123456789 none</code>"
+    )
+    parts = (command.args or "").split()
+    target_id = parse_id(parts[0]) if parts else None
+    if target_id is None or len(parts) < 2:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    wanted = parts[1].lower()
+    new_class = class_token(wanted)
+    if new_class is None and wanted not in ("none", "reset"):
+        await message.answer(usage, parse_mode="HTML")
+        return
+    if not user_exists(target_id):
+        await message.answer("❌ Bunday foydalanuvchi topilmadi.")
+        return
+
+    if new_class:
+        set_user_class(target_id, new_class)
+        await message.answer(
+            f"✅ <code>{target_id}</code> sinfi: <b>{esc(class_name(new_class))}</b>",
+            parse_mode="HTML"
+        )
+        await safe_send(
+            target_id,
+            f"🏫 Sinfingiz <b>{esc(class_name(new_class))}</b> ga o'zgartirildi. Jadval: /schedule"
+        )
+    else:
+        cursor.execute("UPDATE users SET class_id = NULL WHERE user_id = ?", (target_id,))
+        conn.commit()
+        await message.answer(f"✅ <code>{target_id}</code> sinfi tozalandi.", parse_mode="HTML")
+        await safe_send(target_id, "🏫 Sinfingiz tozalandi. Iltimos, /class orqali qaytadan tanlang.")
+
+
+# --- SCHEDULE CHANGES / HOLIDAYS (admin, per class) ---
 @dp.message(Command("holiday"))
 async def cmd_holiday(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    parts = (command.args or "").split(maxsplit=1)
+    scope, rest = resolve_scope(command.args, message.from_user.id, allow_all=True)
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
+        return
+
+    parts = rest.split(maxsplit=1)
     target = parse_date(parts[0]) if parts else None
     if target is None:
         await message.answer(
-            "⚠️ Ishlatish: <code>/holiday &lt;sana&gt; [sabab]</code>\n"
-            "Masalan: <code>/holiday 2026-10-01 O'qituvchilar kuni</code>",
+            "⚠️ Ishlatish: <code>/holiday [sinf|all] &lt;sana&gt; [sabab]</code>\n"
+            "Masalan: <code>/holiday all 2026-10-01 O'qituvchilar kuni</code>\n"
+            "yoki: <code>/holiday 10a ertaga</code>",
             parse_mode="HTML"
         )
         return
 
     reason = parts[1].strip() if len(parts) > 1 else ""
-    cursor.execute(
-        "INSERT OR REPLACE INTO overrides (day_date, lesson, kind, note) VALUES (?, 0, 'off', ?)",
-        (target.isoformat(), reason),
-    )
+    for class_id in scope:
+        cursor.execute(
+            "INSERT OR REPLACE INTO class_overrides (class_id, day_date, lesson, kind, note) "
+            "VALUES (?, ?, 0, 'off', ?)",
+            (class_id, target.isoformat(), reason),
+        )
     conn.commit()
-    await message.answer(f"🎉 <code>{target.isoformat()}</code> kuni dars yo'q deb belgilandi.", parse_mode="HTML")
+    names = ", ".join(class_name(c) for c in scope)
+    await message.answer(
+        f"🎉 <code>{target.isoformat()}</code> kuni dars yo'q deb belgilandi: <b>{esc(names)}</b>",
+        parse_mode="HTML"
+    )
 
 
 @dp.message(Command("change"))
@@ -999,55 +1350,73 @@ async def cmd_change(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
+    scope, rest = resolve_scope(command.args, message.from_user.id)
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
+        return
+    class_id = scope[0]
+
     usage = (
-        "⚠️ Ishlatish: <code>/change &lt;sana&gt; &lt;dars#&gt; &lt;matn&gt;</code>\n"
+        "⚠️ Ishlatish: <code>/change [sinf] &lt;sana&gt; &lt;dars#&gt; &lt;matn&gt;</code>\n"
         "Masalan: <code>/change ertaga 3 Bekor qilindi</code>\n"
-        "yoki: <code>/change 2026-10-05 2 Xona 305 ga ko'chdi</code>"
+        "yoki: <code>/change 10a 2026-10-05 2 Xona 305 ga ko'chdi</code>"
     )
-    parts = (command.args or "").split(maxsplit=2)
+    parts = rest.split(maxsplit=2)
     if len(parts) < 3:
         await message.answer(usage, parse_mode="HTML")
         return
 
     target = parse_date(parts[0])
     lesson = parse_id(parts[1])
-    if target is None or lesson is None or not 1 <= lesson <= len(BELL_SCHEDULE):
+    if target is None or lesson is None or not 1 <= lesson <= len(class_bells(class_id)):
         await message.answer(usage, parse_mode="HTML")
         return
 
     cursor.execute(
-        "INSERT OR REPLACE INTO overrides (day_date, lesson, kind, note) VALUES (?, ?, 'note', ?)",
-        (target.isoformat(), lesson, parts[2].strip()),
+        "INSERT OR REPLACE INTO class_overrides (class_id, day_date, lesson, kind, note) "
+        "VALUES (?, ?, ?, 'note', ?)",
+        (class_id, target.isoformat(), lesson, parts[2].strip()),
     )
     conn.commit()
     await message.answer(
-        f"⚠️ <code>{target.isoformat()}</code> kuni {lesson}-darsga eslatma qo'shildi.",
+        f"⚠️ {esc(class_name(class_id))}: <code>{target.isoformat()}</code> kuni {lesson}-darsga eslatma qo'shildi.",
         parse_mode="HTML"
     )
 
 
 @dp.message(Command("changes"))
-async def cmd_changes(message: types.Message):
+async def cmd_changes(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
+    scope, _ = resolve_scope(command.args, message.from_user.id, allow_all=True)
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
+        return
+
     today = datetime.now(UZB_TZ).date().isoformat()
-    cursor.execute(
-        "SELECT day_date, lesson, kind, note FROM overrides WHERE day_date >= ? ORDER BY day_date, lesson LIMIT 40",
-        (today,),
-    )
-    rows = cursor.fetchall()
-    if not rows:
+    lines = []
+    for class_id in scope:
+        cursor.execute(
+            "SELECT day_date, lesson, kind, note FROM class_overrides "
+            "WHERE class_id = ? AND day_date >= ? ORDER BY day_date, lesson LIMIT 40",
+            (class_id, today),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            continue
+        lines.append(f"\n<b>{esc(class_name(class_id))}</b>")
+        for day_date, lesson, kind, note in rows:
+            if kind == "off":
+                lines.append(f"• <code>{day_date}</code> — 🎉 dars yo'q {esc(note)}".rstrip())
+            else:
+                lines.append(f"• <code>{day_date}</code> — {lesson}-dars: {esc(note)}")
+
+    if not lines:
         await message.answer("ℹ️ Kelgusi o'zgarishlar yo'q.")
         return
 
-    lines = ["🗓 <b>Kelgusi o'zgarishlar:</b>\n"]
-    for day_date, lesson, kind, note in rows:
-        if kind == "off":
-            lines.append(f"• <code>{day_date}</code> — 🎉 dars yo'q {esc(note)}".rstrip())
-        else:
-            lines.append(f"• <code>{day_date}</code> — {lesson}-dars: {esc(note)}")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("🗓 <b>Kelgusi o'zgarishlar:</b>" + "\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("clearchange"))
@@ -1055,36 +1424,59 @@ async def cmd_clear_change(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    target = parse_date(command.args.split()[0]) if command.args else None
-    if target is None:
-        await message.answer("⚠️ Ishlatish: <code>/clearchange &lt;sana&gt;</code>", parse_mode="HTML")
+    scope, rest = resolve_scope(command.args, message.from_user.id, allow_all=True)
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
         return
 
-    cursor.execute("DELETE FROM overrides WHERE day_date = ?", (target.isoformat(),))
-    removed = cursor.rowcount
+    words = rest.split()
+    target = parse_date(words[0]) if words else None
+    if target is None:
+        await message.answer(
+            "⚠️ Ishlatish: <code>/clearchange [sinf|all] &lt;sana&gt;</code>", parse_mode="HTML"
+        )
+        return
+
+    removed = 0
+    for class_id in scope:
+        cursor.execute(
+            "DELETE FROM class_overrides WHERE class_id = ? AND day_date = ?",
+            (class_id, target.isoformat()),
+        )
+        removed += cursor.rowcount
     conn.commit()
-    await message.answer(f"🧹 <code>{target.isoformat()}</code> uchun {removed} ta o'zgarish o'chirildi.", parse_mode="HTML")
+    names = ", ".join(class_name(c) for c in scope)
+    await message.answer(
+        f"🧹 {esc(names)}: <code>{target.isoformat()}</code> uchun {removed} ta o'zgarish o'chirildi.",
+        parse_mode="HTML"
+    )
 
 
-# --- TIMETABLE EDITING (admin) ---
+# --- TIMETABLE EDITING (admin, per class) ---
 @dp.message(Command("setlesson"))
 async def cmd_set_lesson(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
+    scope, rest = resolve_scope(command.args, message.from_user.id)
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
+        return
+    class_id = scope[0]
+
     usage = (
-        "⚠️ Ishlatish: <code>/setlesson &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
-        "Masalan: <code>/setlesson 1 3 Ona tili; 208; Q.Umid</code>\n"
+        "⚠️ Ishlatish: <code>/setlesson [sinf] &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
+        "Masalan: <code>/setlesson 10a 1 3 Ona tili; 210; Barno</code>\n"
         "Kun: 1-5 yoki du/se/ch/pa/ju"
     )
-    parts = (command.args or "").split(maxsplit=2)
+    parts = rest.split(maxsplit=2)
     if len(parts) < 3:
         await message.answer(usage, parse_mode="HTML")
         return
 
     day_idx = DAY_CODE_MAP.get(parts[0].lower())
     pos = parse_id(parts[1])
-    if day_idx is None or pos is None or not 1 <= pos <= len(BELL_SCHEDULE):
+    if day_idx is None or pos is None or not 1 <= pos <= len(class_bells(class_id)):
         await message.answer(usage, parse_mode="HTML")
         return
 
@@ -1096,7 +1488,7 @@ async def cmd_set_lesson(message: types.Message, command: CommandObject):
         await message.answer(usage, parse_mode="HTML")
         return
 
-    current_count = len(TIMETABLE.get(day_idx, []))
+    current_count = len(class_timetable(class_id).get(day_idx, []))
     if pos > current_count + 1:
         await message.answer(
             f"❌ Bu kunda hozir {current_count} ta dars bor. Avval {current_count + 1}-darsni qo'shing."
@@ -1104,13 +1496,15 @@ async def cmd_set_lesson(message: types.Message, command: CommandObject):
         return
 
     cursor.execute(
-        "INSERT OR REPLACE INTO timetable (day, pos, subject, room, teachers) VALUES (?, ?, ?, ?, ?)",
-        (day_idx, pos, subject, room, teachers),
+        "INSERT OR REPLACE INTO class_timetable (class_id, day, pos, subject, room, teachers) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (class_id, day_idx, pos, subject, room, teachers),
     )
     conn.commit()
     load_timetable()
     await message.answer(
-        f"✅ {esc(DAY_NAMES[day_idx])}, {pos}-dars: <b>{esc(subject)}</b> | {esc(room)} | {esc(teachers)}",
+        f"✅ {esc(class_name(class_id))} · {esc(DAY_NAMES[day_idx])}, {pos}-dars: "
+        f"<b>{esc(subject)}</b> | {esc(room)} | {esc(teachers)}",
         parse_mode="HTML"
     )
 
@@ -1120,23 +1514,37 @@ async def cmd_del_lesson(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    day_idx = DAY_CODE_MAP.get(command.args.split()[0].lower()) if command.args else None
+    scope, rest = resolve_scope(command.args, message.from_user.id)
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
+        return
+    class_id = scope[0]
+
+    words = rest.split()
+    day_idx = DAY_CODE_MAP.get(words[0].lower()) if words else None
     if day_idx is None:
-        await message.answer("⚠️ Ishlatish: <code>/dellesson &lt;kun&gt;</code> (1-5 yoki du/se/ch/pa/ju)", parse_mode="HTML")
+        await message.answer(
+            "⚠️ Ishlatish: <code>/dellesson [sinf] &lt;kun&gt;</code> (kun: 1-5 yoki du/se/ch/pa/ju)",
+            parse_mode="HTML"
+        )
         return
 
-    lessons = TIMETABLE.get(day_idx, [])
+    lessons = class_timetable(class_id).get(day_idx, [])
     if not lessons:
         await message.answer("❌ Bu kunda darslar yo'q.")
         return
 
     last_pos = len(lessons)
     removed = lessons[-1]["subject"]
-    cursor.execute("DELETE FROM timetable WHERE day = ? AND pos = ?", (day_idx, last_pos))
+    cursor.execute(
+        "DELETE FROM class_timetable WHERE class_id = ? AND day = ? AND pos = ?",
+        (class_id, day_idx, last_pos),
+    )
     conn.commit()
     load_timetable()
     await message.answer(
-        f"🗑 {esc(DAY_NAMES[day_idx])}, {last_pos}-dars (<b>{esc(removed)}</b>) o'chirildi.",
+        f"🗑 {esc(class_name(class_id))} · {esc(DAY_NAMES[day_idx])}, {last_pos}-dars "
+        f"(<b>{esc(removed)}</b>) o'chirildi.",
         parse_mode="HTML"
     )
 
@@ -1174,8 +1582,10 @@ async def forward_to_owner(message: types.Message):
         return
 
     uname = f"@{esc(user.username)}" if user.username else "NoUsername"
+    class_id = get_user_class(user.id)
+    short = CLASSES[class_id]["short"] if class_id else "—"
     header = (
-        f"📨 <b>{esc(user.first_name or 'NoName')}</b> ({uname}) | ID: <code>{user.id}</code>\n"
+        f"📨 <b>{esc(user.first_name or 'NoName')}</b> ({uname}) | 🏫 {short} | ID: <code>{user.id}</code>\n"
         f"Javob: <code>/dm {user.id} </code>"
     )
     try:
@@ -1186,33 +1596,37 @@ async def forward_to_owner(message: types.Message):
         logging.error(f"Could not forward message from {user.id} to owner: {e}")
 
 
-# --- AUTOMATED SCHEDULER JOBS ---
-async def send_morning_alert():
+# --- AUTOMATED SCHEDULER JOBS (one set of jobs per class) ---
+async def send_morning_alert(class_id: str):
     today = datetime.now(UZB_TZ).date()
-    if today.weekday() not in TIMETABLE:
+    if today.weekday() not in class_timetable(class_id):
         return
 
-    if get_off_reason(today) is not None:
-        msg = "☀️ <b>Xayrli kun!</b>\n\n" + format_date_schedule(today)
+    if get_off_reason(class_id, today) is not None:
+        msg = "☀️ <b>Xayrli kun!</b>\n\n" + format_date_schedule(class_id, today)
     else:
-        msg = "☀️ <b>Xayrli kun! Darslar boshlanishiga 1 soat qoldi.</b>\n\n" + format_date_schedule(today)
-    await broadcast_message(msg, flag="morning_alert")
+        msg = (
+            "☀️ <b>Xayrli kun! Darslar boshlanishiga 1 soat qoldi.</b>\n\n"
+            + format_date_schedule(class_id, today)
+        )
+    await broadcast_message(msg, flag="morning_alert", class_id=class_id)
 
 
-async def send_lesson_end_alert(lesson_num: int):
+async def send_lesson_end_alert(class_id: str, lesson_num: int):
     today = datetime.now(UZB_TZ).date()
-    lessons = effective_lessons(today)
+    bells = class_bells(class_id)
+    lessons = effective_lessons(class_id, today)
     idx = lesson_num - 1
 
     if idx >= len(lessons):
         return
 
     current_lesson = lessons[idx]
-    bell = BELL_SCHEDULE[idx]
+    bell = bells[idx]
 
     if idx + 1 < len(lessons):
         next_lesson = lessons[idx + 1]
-        next_bell = BELL_SCHEDULE[idx + 1]
+        next_bell = bells[idx + 1]
         msg = (
             f"🔔 <b>{bell['lesson']}-dars ({esc(current_lesson['subject'])}) tugadi!</b>\n\n"
             f"➡️ <b>Keyingi dars ({next_bell['lesson']}-dars):</b> {esc(next_lesson['subject'])}\n"
@@ -1220,7 +1634,7 @@ async def send_lesson_end_alert(lesson_num: int):
             f"🚪 <b>Xona:</b> {esc(next_lesson['room'])}\n"
             f"👨‍🏫 <b>O'qituvchi:</b> {esc(next_lesson['teachers'])}"
         )
-        note = get_notes(today).get(next_bell["lesson"])
+        note = get_notes(class_id, today).get(next_bell["lesson"])
         if note:
             msg += f"\n⚠️ <b>{esc(note)}</b>"
     else:
@@ -1229,23 +1643,27 @@ async def send_lesson_end_alert(lesson_num: int):
             f"Bugungi barcha darslar yakunlandi.</b>"
         )
 
-    await broadcast_message(msg, flag="lesson_alerts")
+    await broadcast_message(msg, flag="lesson_alerts", class_id=class_id)
 
 
 def setup_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=UZB_TZ)
 
-    # 1. Morning schedule alert at 08:00 AM (Mon-Fri)
-    scheduler.add_job(send_morning_alert, "cron", day_of_week="mon-fri", hour=8, minute=0)
+    for class_id, cfg in CLASSES.items():
+        # 1. Morning schedule alert (Mon-Fri)
+        m_hour, m_minute = map(int, cfg["morning"].split(":"))
+        scheduler.add_job(
+            send_morning_alert, "cron", day_of_week="mon-fri",
+            hour=m_hour, minute=m_minute, args=[class_id],
+        )
 
-    # 2. Lesson End Alerts (Mon-Fri) matching bell schedule
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=9, minute=45, args=[1])
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=10, minute=35, args=[2])
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=11, minute=25, args=[3])
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=12, minute=15, args=[4])
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=13, minute=30, args=[5])
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=14, minute=20, args=[6])
-    scheduler.add_job(send_lesson_end_alert, "cron", day_of_week="mon-fri", hour=15, minute=10, args=[7])
+        # 2. Lesson end alerts (Mon-Fri) matching the bell schedule of the class
+        for bell in cfg["bells"]:
+            e_hour, e_minute = map(int, bell["end"].split(":"))
+            scheduler.add_job(
+                send_lesson_end_alert, "cron", day_of_week="mon-fri",
+                hour=e_hour, minute=e_minute, args=[class_id, bell["lesson"]],
+            )
 
     return scheduler
 
