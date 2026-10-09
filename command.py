@@ -199,7 +199,10 @@ OWNER_HELP = (
     "• <code>/broadcast_teachers &lt;xabar&gt;</code> — faqat o'qituvchilarga\n"
     "• <code>/setteacher &lt;ism&gt; &lt;user_id&gt;</code> — o'qituvchi rejimini yoqish\n"
     "• <code>/removeteacher &lt;user_id&gt;</code> — o'qituvchi rejimini o'chirish\n"
-    "• <code>/teachers</code> — o'qituvchilar ro'yxati"
+    "• <code>/teachers</code> — o'qituvchilar ro'yxati\n"
+    "• <code>/setteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt; &lt;sinf&gt;; [fan]</code> — o'qituvchiga dars qo'shish / almashtirish\n"
+    "• <code>/delteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt;</code> — o'qituvchi darsini o'chirish\n"
+    "• <code>/teacherweek [ism]</code> — o'qituvchining saqlangan jadvali"
 )
 
 
@@ -1345,6 +1348,122 @@ async def cmd_teachers(message: types.Message):
             f"{esc(TEACHERS[teacher_key]['name'])}"
         )
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --- TEACHER LESSONS (owner only, like /setlesson for students) ---
+def resolve_teacher(args: str | None):
+    """The first word may be the teacher's name. With only one teacher the name is optional.
+    Returns (teacher_key or None, remaining_text)."""
+    text = (args or "").strip()
+    parts = text.split(maxsplit=1)
+    rest = parts[1] if len(parts) > 1 else ""
+    if parts:
+        key = teacher_token(parts[0])
+        if key:
+            return key, rest
+    if len(TEACHERS) == 1:
+        return next(iter(TEACHERS)), text
+    return None, text
+
+
+NEED_TEACHER = "⚠️ O'qituvchini ko'rsating: <code>{names}</code>"
+
+
+@router.message(Command("setteacherlesson", "tlesson"), IsOwner())
+async def cmd_set_teacher_lesson(message: types.Message, command: CommandObject):
+    """/setteacherlesson umarbek 1 3 9-A aniq; Informatika  -  adds or replaces one lesson slot."""
+    teacher_key, rest = resolve_teacher(command.args)
+    if teacher_key is None:
+        await message.answer(NEED_TEACHER.format(names=esc(", ".join(TEACHERS))), parse_mode="HTML")
+        return
+
+    usage = (
+        "⚠️ Ishlatish: <code>/setteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt; &lt;sinf&gt;; [fan]</code>\n"
+        "Masalan: <code>/setteacherlesson umarbek 1 3 9-A aniq; Informatika</code>\n"
+        "Kun: 1-6 yoki du/se/ch/pa/ju/sh. Dars#: 1-8. Fan yozilmasa — o'qituvchining asosiy fani."
+    )
+    parts = rest.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    day_idx = TEACHER_DAY_CODE_MAP.get(parts[0].lower())
+    lesson = parse_id(parts[1])
+    if day_idx is None or lesson is None or not 1 <= lesson <= len(TEACHER_BELLS):
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    fields = [f.strip() for f in parts[2].split(";")]
+    class_label = fields[0]
+    subject = fields[1] if len(fields) > 1 and fields[1] else TEACHERS[teacher_key]["subject"]
+    if not class_label:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    existed = any(item["lesson"] == lesson for item in TEACHERS[teacher_key]["timetable"].get(day_idx, []))
+    cursor.execute(
+        "INSERT OR REPLACE INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (teacher_key, day_idx, lesson, class_label, class_id_from_label(class_label), subject),
+    )
+    conn.commit()
+    load_teacher_timetables()
+
+    bell = teacher_bell(lesson)
+    status = "🔄 Almashtirildi" if existed else "✅ Qo'shildi"
+    await message.answer(
+        f"{status}: {esc(TEACHERS[teacher_key]['short'])} · "
+        f"{esc(TEACHER_DAY_NAMES[day_idx])}, {lesson}-dars ({bell['start']} - {bell['end']})\n"
+        f"🏫 <b>{esc(class_label)}</b> — {esc(subject)}",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("delteacherlesson", "deltlesson"), IsOwner())
+async def cmd_del_teacher_lesson(message: types.Message, command: CommandObject):
+    """/delteacherlesson umarbek 1 3  -  removes one lesson slot."""
+    teacher_key, rest = resolve_teacher(command.args)
+    if teacher_key is None:
+        await message.answer(NEED_TEACHER.format(names=esc(", ".join(TEACHERS))), parse_mode="HTML")
+        return
+
+    usage = (
+        "⚠️ Ishlatish: <code>/delteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt;</code>\n"
+        "Masalan: <code>/delteacherlesson umarbek 1 3</code>"
+    )
+    words = rest.split()
+    day_idx = TEACHER_DAY_CODE_MAP.get(words[0].lower()) if words else None
+    lesson = parse_id(words[1]) if len(words) > 1 else None
+    if day_idx is None or lesson is None:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    cursor.execute(
+        "DELETE FROM teacher_timetable WHERE teacher_key = ? AND day = ? AND lesson = ?",
+        (teacher_key, day_idx, lesson),
+    )
+    removed = cursor.rowcount
+    conn.commit()
+    load_teacher_timetables()
+
+    if not removed:
+        await message.answer(f"❌ {esc(TEACHER_DAY_NAMES[day_idx])}, {lesson}-darsda dars yo'q.", parse_mode="HTML")
+        return
+    await message.answer(
+        f"🗑 {esc(TEACHERS[teacher_key]['short'])} · {esc(TEACHER_DAY_NAMES[day_idx])}, "
+        f"{lesson}-dars o'chirildi.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("teacherweek"), IsOwner())
+async def cmd_teacher_week(message: types.Message, command: CommandObject):
+    """/teacherweek [ism]  -  shows the saved timetable of a teacher (to check your edits)."""
+    teacher_key, _ = resolve_teacher(command.args)
+    if teacher_key is None:
+        await message.answer(NEED_TEACHER.format(names=esc(", ".join(TEACHERS))), parse_mode="HTML")
+        return
+    await message.answer(format_teacher_timetable(teacher_key), parse_mode="HTML")
 
 
 # ======================================================================

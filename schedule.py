@@ -110,6 +110,18 @@ cursor.execute("""
         value TEXT
     )
 """)
+# Teacher timetables (one row = one lesson slot of one teacher; slots may have gaps)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS teacher_timetable (
+        teacher_key TEXT,
+        day INTEGER,
+        lesson INTEGER,
+        class_label TEXT,
+        class_id TEXT,
+        subject TEXT,
+        PRIMARY KEY (teacher_key, day, lesson)
+    )
+""")
 conn.commit()
 
 # Notification settings users can toggle in /settings
@@ -350,7 +362,8 @@ TEACHERS = {
         "short": "Umarbek",
         "subject": "Informatika",
         "morning": "08:00",
-        "timetable": TIMETABLE_UMARBEK,
+        "default": TIMETABLE_UMARBEK,   # copied into the database on the first run only
+        "timetable": {},                # live timetable, loaded from the database
     },
 }
 
@@ -422,6 +435,44 @@ for _cid in CLASSES:
 load_timetable()
 
 
+def seed_teacher_if_needed(teacher_key: str):
+    """Copies the default lessons of a teacher into the database (only once per teacher)."""
+    if get_setting(f"seeded_teacher_{teacher_key}") == "1":
+        return
+    cursor.execute("SELECT COUNT(*) FROM teacher_timetable WHERE teacher_key = ?", (teacher_key,))
+    if cursor.fetchone()[0] == 0:
+        for day, lessons in TEACHERS[teacher_key]["default"].items():
+            for item in lessons:
+                cursor.execute(
+                    "INSERT INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (teacher_key, day, item["lesson"], item["class"], item["class_id"], item["subject"]),
+                )
+        conn.commit()
+    set_setting(f"seeded_teacher_{teacher_key}", "1")
+
+
+def load_teacher_timetables():
+    """Reloads the lessons of every teacher from the database."""
+    fresh: dict[str, dict[int, list[dict]]] = {key: {} for key in TEACHERS}
+    cursor.execute(
+        "SELECT teacher_key, day, lesson, class_label, class_id, subject FROM teacher_timetable "
+        "ORDER BY teacher_key, day, lesson"
+    )
+    for key, day, lesson, class_label, class_id, subject in cursor.fetchall():
+        if key in fresh:
+            fresh[key].setdefault(day, []).append(
+                {"lesson": lesson, "class": class_label, "class_id": class_id, "subject": subject}
+            )
+    for key in TEACHERS:
+        TEACHERS[key]["timetable"] = fresh[key]
+
+
+for _tkey in TEACHERS:
+    seed_teacher_if_needed(_tkey)
+load_teacher_timetables()
+
+
 def class_bells(class_id: str) -> list[dict]:
     return CLASSES[class_id]["bells"]
 
@@ -440,6 +491,13 @@ def class_token(raw: str | None) -> str | None:
         return None
     token = raw.lower().replace("-", "")
     return token if token in CLASSES else None
+
+
+def class_id_from_label(label: str) -> str | None:
+    """'10-B aniq' / '10b' -> '10b' when it is a class of the bot (so that class holidays also
+    cancel the teacher's lesson), otherwise None (e.g. '9-A aniq')."""
+    words = label.split()
+    return class_token(words[0]) if words else None
 
 
 def teacher_token(raw: str | None) -> str | None:
@@ -997,6 +1055,26 @@ def format_teacher_week(teacher_key: str, start: date) -> str:
             continue
         for item in lessons:
             text += f"{item['lesson']}. {esc(item['class'])}\n"
+        text += "\n"
+    return text
+
+
+def format_teacher_timetable(teacher_key: str) -> str:
+    """The saved weekly timetable of a teacher, exactly as stored (no holidays applied)."""
+    cfg = TEACHERS[teacher_key]
+    text = f"🗓 <b>{esc(cfg['name'])}</b> — dars jadvali\n\n"
+    for wd in range(6):
+        text += f"<b>{esc(TEACHER_DAY_NAMES[wd])}</b>\n"
+        lessons = cfg["timetable"].get(wd, [])
+        if not lessons:
+            text += "—\n\n"
+            continue
+        for item in lessons:
+            bell = teacher_bell(item["lesson"])
+            line = f"{item['lesson']}. ({bell['start']}-{bell['end']}) {esc(item['class'])}"
+            if item["subject"] != cfg["subject"]:
+                line += f" — {esc(item['subject'])}"
+            text += line + "\n"
         text += "\n"
     return text
 
