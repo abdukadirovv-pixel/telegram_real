@@ -80,6 +80,7 @@ ensure_column("users", "lesson_alerts", "INTEGER DEFAULT 1")
 ensure_column("users", "announcements", "INTEGER DEFAULT 1")
 ensure_column("users", "class_id", "TEXT")
 ensure_column("users", "teacher_key", "TEXT")          # set only by the owner (/setteacher)
+ensure_column("users", "admin_class", "TEXT")          # class admin: admin of ONE class only
 ensure_column("users", "menu_shown", "INTEGER DEFAULT 0")
 
 # Every class has its OWN timetable and its OWN overrides (nothing is shared or merged)
@@ -551,8 +552,48 @@ def get_all_users():
 
 
 def set_user_role(user_id: int, role: str):
-    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, int(user_id)))
+    """Changing the role always clears a class-admin scope (use set_class_admin for class admins)."""
+    cursor.execute("UPDATE users SET role = ?, admin_class = NULL WHERE user_id = ?", (role, int(user_id)))
     conn.commit()
+
+
+# --- class admins: an admin who manages ONE class only ---
+def get_admin_class(user_id: int) -> str | None:
+    """The class a class-admin is responsible for. None for the owner, global admins and normal users."""
+    if int(user_id) == OWNER_ID:
+        return None
+    cursor.execute("SELECT role, admin_class FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    if row and row[0] == "admin" and row[1] in CLASSES:
+        return row[1]
+    return None
+
+
+def is_global_admin(user_id: int) -> bool:
+    """Owner or an admin without a class limit."""
+    return is_admin_or_owner(user_id) and get_admin_class(user_id) is None
+
+
+def set_class_admin(user_id: int, class_id: str):
+    """Makes the user an admin of ONE class. If he has no class yet he is put into that class."""
+    cursor.execute(
+        "UPDATE users SET role = 'admin', admin_class = ? WHERE user_id = ?", (class_id, int(user_id))
+    )
+    cursor.execute(
+        "UPDATE users SET class_id = ? WHERE user_id = ? AND class_id IS NULL", (class_id, int(user_id))
+    )
+    conn.commit()
+
+
+def can_manage_user(admin_id: int, target_id: int) -> bool:
+    """Owner and global admins may manage anybody. A class admin only the students of his own class
+    (never admins, the owner or teachers)."""
+    admin_class = get_admin_class(admin_id)
+    if admin_class is None:
+        return is_admin_or_owner(admin_id)
+    if get_user_role(target_id) in ("admin", "owner") or get_user_teacher(target_id):
+        return False
+    return get_user_class(target_id) == admin_class
 
 
 def user_exists(user_id: int) -> bool:
@@ -697,7 +738,7 @@ def get_users_in_scope(scope: str, include_teachers: bool):
         return []
     where, params = spec
     cursor.execute(
-        "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key "
+        "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key, admin_class "
         f"FROM users WHERE {where} ORDER BY first_name COLLATE NOCASE",
         params,
     )

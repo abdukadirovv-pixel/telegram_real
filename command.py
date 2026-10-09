@@ -106,6 +106,11 @@ NEED_CLASS = (
 )
 
 
+DENIED_CLASS = "⛔ Siz faqat o'z sinfingizni boshqara olasiz."
+DENIED_USER = "⛔ Siz faqat o'z sinfingiz o'quvchilarini boshqara olasiz."
+GLOBAL_ONLY = "⛔ Bu buyruq faqat asosiy adminlar uchun."
+
+
 def welcome_text(class_id: str) -> str:
     return (
         "👋 <b>Xush kelibsiz!</b> Bot sizni eslab qoldi.\n"
@@ -190,10 +195,34 @@ ADMIN_HELP = (
     "Sana: <code>YYYY-MM-DD</code>, <code>bugun</code> yoki <code>ertaga</code>"
 )
 
+def class_admin_help(class_id: str) -> str:
+    """Help of a class admin: only what he is allowed to do (his own class)."""
+    return (
+        f"🛠 <b>Sinf admini: {esc(class_name(class_id))}</b>\n\n"
+        "Siz faqat o'z sinfingizni boshqara olasiz.\n\n"
+        "• <code>/users</code> — sinfingiz o'quvchilari\n"
+        f"• <code>/broadcast_{class_id} &lt;xabar&gt;</code> — sinfingizga e'lon\n"
+        "• <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code> — o'quvchiga xabar\n"
+        "• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>\n"
+        f"• <code>/setclass &lt;user_id&gt; {class_id}</code> — sinfsiz o'quvchini sinfingizga qo'shish "
+        "(<code>none</code> — sinfdan chiqarish)\n\n"
+        "📅 <b>Jadval</b>\n"
+        "• <code>/holiday &lt;sana&gt; [sabab]</code> — dars yo'q kuni\n"
+        "• <code>/change &lt;sana&gt; &lt;dars#&gt; &lt;matn&gt;</code> — darsga eslatma\n"
+        "• <code>/changes</code> — o'zgarishlar ro'yxati\n"
+        "• <code>/clearchange &lt;sana&gt;</code> — o'zgarishlarni o'chirish\n"
+        "• <code>/setlesson &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
+        "• <code>/dellesson &lt;kun&gt;</code> — kunning oxirgi darsini o'chirish\n"
+        "Sana: <code>YYYY-MM-DD</code>, <code>bugun</code> yoki <code>ertaga</code>"
+    )
+
+
 OWNER_HELP = (
     "\n\n👑 <b>Owner buyruqlari</b>\n\n"
     "• <code>/makeadmin &lt;user_id&gt;</code>\n"
     "• <code>/removeadmin &lt;user_id&gt;</code>\n"
+    "• <code>/makeclassadmin &lt;user_id&gt; &lt;sinf&gt;</code> — faqat bitta sinf admini\n"
+    "• <code>/admins</code> — adminlar ro'yxati\n"
     "• <code>/inbox on|off</code> — foydalanuvchi xabarlarini senga yuborish\n"
     "• <code>/users teachers</code> — o'qituvchilar oynasi\n"
     "• <code>/broadcast_teachers &lt;xabar&gt;</code> — faqat o'qituvchilarga\n"
@@ -225,6 +254,16 @@ async def require_owner(message: types.Message, text: str) -> bool:
     return True
 
 
+async def require_global_admin(message: types.Message) -> bool:
+    """Owner or a normal (global) admin. Class admins are refused."""
+    if not await require_admin(message):
+        return False
+    if get_admin_class(message.from_user.id):
+        await message.answer(GLOBAL_ONLY)
+        return False
+    return True
+
+
 async def ensure_class(message: types.Message) -> str | None:
     """Returns the user's class, or shows the class buttons and returns None."""
     class_id = get_user_class(message.from_user.id)
@@ -236,20 +275,45 @@ async def ensure_class(message: types.Message) -> str | None:
 
 def resolve_scope(args: str | None, user_id: int, allow_all: bool = False):
     """For admin commands. The first word may be a class code (10a / 10b) or 'all'.
-    Returns (list_of_class_ids or None, remaining_text). Without a code the admin's own class is used."""
+    Returns (list_of_class_ids | None | 'denied', remaining_text).
+    Without a code the admin's own class is used. A class admin may only work with his own class."""
     text = (args or "").strip()
     parts = text.split(maxsplit=1)
     rest = parts[1] if len(parts) > 1 else ""
+
+    explicit = None
     if parts:
         first = class_token(parts[0])
         if first:
-            return [first], rest
-        if allow_all and parts[0].lower() in ("all", "hamma"):
-            return list(CLASSES), rest
+            explicit = [first]
+        elif allow_all and parts[0].lower() in ("all", "hamma"):
+            explicit = list(CLASSES)
+    remainder = rest if explicit is not None else text
+
+    admin_class = get_admin_class(user_id)
+    if admin_class:
+        if explicit is not None and explicit != [admin_class]:
+            return "denied", remainder
+        return [admin_class], remainder
+
+    if explicit is not None:
+        return explicit, remainder
     own = get_user_class(user_id)
     if own:
         return [own], text
     return None, text
+
+
+async def get_scope(message: types.Message, args: str | None, allow_all: bool = False):
+    """resolve_scope + the error messages. Returns (class_ids, rest) or None (message already sent)."""
+    scope, rest = resolve_scope(args, message.from_user.id, allow_all)
+    if scope == "denied":
+        await message.answer(DENIED_CLASS)
+        return None
+    if scope is None:
+        await message.answer(NEED_CLASS, parse_mode="HTML")
+        return None
+    return scope, rest
 
 
 async def safe_edit(call: types.CallbackQuery, text: str, markup: InlineKeyboardMarkup):
@@ -634,6 +698,10 @@ async def cb_settings(call: types.CallbackQuery):
 async def cmd_admin_help(message: types.Message):
     """Help for admins and the owner (not listed in the normal /help)."""
     register_or_update_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    admin_class = get_admin_class(message.from_user.id)
+    if admin_class:
+        await message.answer(class_admin_help(admin_class), parse_mode="HTML")
+        return
     text = ADMIN_HELP
     if get_user_role(message.from_user.id) == "owner":
         text += OWNER_HELP
@@ -674,7 +742,7 @@ def users_menu_keyboard(include_teachers: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def render_users_window(scope: str, page: int, include_teachers: bool):
+def render_users_window(scope: str, page: int, include_teachers: bool, show_back: bool = True):
     """Returns (text, keyboard) of one /users window (one page of one section)."""
     rows = get_users_in_scope(scope, include_teachers)
     total_pages = max(1, math.ceil(len(rows) / USERS_PAGE_SIZE))
@@ -693,11 +761,14 @@ def render_users_window(scope: str, page: int, include_teachers: bool):
 
     if not chunk:
         text += "Bu bo'limda foydalanuvchi yo'q."
-    for u_id, uname, fname, role, is_active, banned, class_id, teacher_key in chunk:
+    for u_id, uname, fname, role, is_active, banned, class_id, teacher_key, admin_class in chunk:
         name = esc(fname or "NoName")
         un = f"@{esc(uname)}" if uname and uname != "NoUsername" else "NoUsername"
         flags = (" 🚫" if banned else "") + (" 💤" if not is_active else "")
-        line = f"• <b>{name}</b> ({un}) | ID: <code>{u_id}</code> | <code>{role}</code>{flags}"
+        role_label = role
+        if role == "admin" and admin_class in CLASSES:
+            role_label = f"admin·{CLASSES[admin_class]['short']}"   # class admin
+        line = f"• <b>{name}</b> ({un}) | ID: <code>{u_id}</code> | <code>{role_label}</code>{flags}"
         if scope == "all":  # mixed window: show where the person belongs
             if include_teachers and teacher_key in TEACHERS:
                 line += f" | 👨‍🏫 {esc(TEACHERS[teacher_key]['short'])}"
@@ -713,7 +784,8 @@ def render_users_window(scope: str, page: int, include_teachers: bool):
             InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="usr:noop"),
             InlineKeyboardButton(text="▶️", callback_data=f"usr:{scope}:{min(page + 1, total_pages - 1)}"),
         ])
-    keyboard_rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="usr:menu")])
+    if show_back:
+        keyboard_rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="usr:menu")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
@@ -722,6 +794,13 @@ async def cmd_list_users(message: types.Message, command: CommandObject):
     """/users opens a menu; every class (and the teachers, owner only) has its own window.
     Shortcuts: /users 10a, /users 10b, /users none, /users all, /users teachers (owner)."""
     if not await require_admin(message):
+        return
+
+    # a class admin sees only the window of his own class
+    admin_class = get_admin_class(message.from_user.id)
+    if admin_class:
+        text, keyboard = render_users_window(admin_class, 0, False, show_back=False)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
         return
 
     include_teachers = get_user_role(message.from_user.id) == "owner"
@@ -747,10 +826,16 @@ async def cb_users(call: types.CallbackQuery):
         return
 
     include_teachers = get_user_role(call.from_user.id) == "owner"
+    admin_class = get_admin_class(call.from_user.id)
     parts = call.data.split(":")
     action = parts[1] if len(parts) > 1 else ""
 
-    if action == "menu":
+    if admin_class:
+        # a class admin only ever gets his own class (whatever button data is sent)
+        page = parse_id(parts[2]) if len(parts) > 2 and action == admin_class else 0
+        text, keyboard = render_users_window(admin_class, page or 0, False, show_back=False)
+        await safe_edit(call, text, keyboard)
+    elif action == "menu":
         await safe_edit(call, users_menu_text(), users_menu_keyboard(include_teachers))
     elif action in CLASSES or action in USERS_SCOPES:
         if action == "teachers" and not include_teachers:
@@ -764,7 +849,7 @@ async def cb_users(call: types.CallbackQuery):
 
 @router.message(Command("stats"))
 async def cmd_stats(message: types.Message):
-    if not await require_admin(message):
+    if not await require_global_admin(message):
         return
 
     def count(where: str) -> int:
@@ -820,6 +905,9 @@ async def cmd_direct_message(message: types.Message, command: CommandObject, bot
     if target_id is None or len(parts) < 2:
         await message.answer("⚠️ Ishlatish: <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code>", parse_mode="HTML")
         return
+    if not can_manage_user(message.from_user.id, target_id):
+        await message.answer(DENIED_USER)
+        return
 
     try:
         await bot.send_message(target_id, f"📩 <b>Admin Xabari:</b>\n\n{esc(parts[1])}", parse_mode="HTML")
@@ -857,6 +945,14 @@ async def cmd_broadcast(message: types.Message, command: CommandObject, bot: Bot
     if not await require_admin(message):
         return
 
+    own_class = get_admin_class(message.from_user.id)
+    if own_class:
+        await message.answer(
+            f"⚠️ Siz faqat o'z sinfingizga yubora olasiz: <code>/broadcast_{own_class} &lt;xabar&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
     first = (command.args or "").split(maxsplit=1)[0].lower() if command.args else ""
     if class_token(first) or first in ("students", "teachers", "all"):
         # safety: the old syntax '/broadcast 10a text' must not be sent to everybody by mistake
@@ -874,7 +970,7 @@ async def cmd_broadcast(message: types.Message, command: CommandObject, bot: Bot
 @router.message(Command("broadcast_students"))
 async def cmd_broadcast_students(message: types.Message, command: CommandObject, bot: Bot):
     """/broadcast_students <xabar>  -  all students of all classes (no teachers)."""
-    if not await require_admin(message):
+    if not await require_global_admin(message):
         return
     await run_broadcast(message, command, bot, "students", "Barcha talabalar")
 
@@ -886,6 +982,10 @@ async def cmd_broadcast_class(message: types.Message, command: CommandObject, bo
         return
     class_id = command.command.split("_", 1)[1].lower()
     if class_id not in CLASSES:
+        return
+    own_class = get_admin_class(message.from_user.id)
+    if own_class and own_class != class_id:
+        await message.answer(DENIED_CLASS)
         return
     await run_broadcast(message, command, bot, class_id, class_name(class_id))
 
@@ -939,6 +1039,75 @@ async def cmd_remove_admin(message: types.Message, command: CommandObject):
     await message.answer(f"👤 <code>{target_id}</code> dan adminlik olindi.", parse_mode="HTML")
 
 
+@router.message(Command("makeclassadmin"))
+async def cmd_make_class_admin(message: types.Message, command: CommandObject, bot: Bot):
+    """/makeclassadmin <user_id> <sinf>  -  an admin who manages ONE class only (owner only)."""
+    if not await require_owner(message, "❌ Faqat Owner sinf admini tayinlashi mumkin!"):
+        return
+
+    usage = (
+        "⚠️ Ishlatish: <code>/makeclassadmin &lt;user_id&gt; &lt;sinf&gt;</code>\n"
+        "Masalan: <code>/makeclassadmin 123456789 10a</code>"
+    )
+    parts = (command.args or "").split()
+    target_id = parse_id(parts[0]) if parts else None
+    class_id = class_token(parts[1]) if len(parts) > 1 else None
+    if target_id is None or class_id is None:
+        await message.answer(usage, parse_mode="HTML")
+        return
+    if not user_exists(target_id):
+        await message.answer("❌ Bu foydalanuvchi botda yo'q (u avval /start bosishi kerak).")
+        return
+    if target_id == OWNER_ID:
+        await message.answer("👑 Owner allaqachon eng yuqori rolda.")
+        return
+    if is_banned(target_id):
+        await message.answer("❌ Bu foydalanuvchi ban qilingan. Avval /unban qiling.")
+        return
+    if get_user_teacher(target_id):
+        await message.answer("❌ Bu foydalanuvchini sinf admini qilib bo'lmaydi.")
+        return
+
+    set_class_admin(target_id, class_id)
+    await message.answer(
+        f"👑 <code>{target_id}</code> — <b>{esc(class_name(class_id))}</b> admini qilindi!",
+        parse_mode="HTML"
+    )
+    await safe_send(
+        bot, target_id,
+        f"👑 Siz <b>{esc(class_name(class_id))}</b> sinfining admini etib tayinlandingiz.\n"
+        "Buyruqlar: /adminhelp"
+    )
+
+
+@router.message(Command("admins"))
+async def cmd_admins(message: types.Message):
+    """Owner: who is admin of what."""
+    if not await require_owner(message, "❌ Faqat Owner foydalana oladi."):
+        return
+
+    cursor.execute(
+        "SELECT user_id, username, first_name, admin_class FROM users WHERE role = 'admin' "
+        "ORDER BY admin_class, first_name COLLATE NOCASE"
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        await message.answer("ℹ️ Hozircha adminlar yo'q.")
+        return
+
+    def line(user_id, username, first_name):
+        un = f"@{esc(username)}" if username and username != "NoUsername" else "NoUsername"
+        return f"• <b>{esc(first_name or 'NoName')}</b> ({un}) | ID: <code>{user_id}</code>"
+
+    text = "👑 <b>Adminlar</b>\n"
+    global_admins = [r for r in rows if r[3] not in CLASSES]
+    text += "\n<b>Asosiy adminlar</b>\n" + ("\n".join(line(*r[:3]) for r in global_admins) or "—") + "\n"
+    for class_id, cfg in CLASSES.items():
+        members = [r for r in rows if r[3] == class_id]
+        text += f"\n<b>{esc(cfg['name'])}</b>\n" + ("\n".join(line(*r[:3]) for r in members) or "—") + "\n"
+    await message.answer(text, parse_mode="HTML")
+
+
 @router.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
     if not await require_admin(message):
@@ -956,6 +1125,9 @@ async def cmd_ban(message: types.Message, command: CommandObject):
         return
     if not user_exists(target_id):
         await message.answer("❌ Bunday foydalanuvchi topilmadi.")
+        return
+    if not can_manage_user(message.from_user.id, target_id):
+        await message.answer(DENIED_USER)
         return
     if get_user_role(target_id) == "admin" and get_user_role(message.from_user.id) != "owner":
         await message.answer("❌ Adminni faqat Owner ban qila oladi.")
@@ -978,6 +1150,9 @@ async def cmd_unban(message: types.Message, command: CommandObject):
         return
     if not user_exists(target_id):
         await message.answer("❌ Bunday foydalanuvchi topilmadi.")
+        return
+    if not can_manage_user(message.from_user.id, target_id):
+        await message.answer(DENIED_USER)
         return
 
     set_banned(target_id, False)
@@ -1013,6 +1188,18 @@ async def cmd_set_class(message: types.Message, command: CommandObject, bot: Bot
         await message.answer("❌ Bu foydalanuvchining sinfini o'zgartirib bo'lmaydi.")
         return
 
+    # a class admin may only take classless students into HIS class or release students of his class
+    own_class = get_admin_class(message.from_user.id)
+    if own_class:
+        target_class = get_user_class(target_id)
+        if (
+            get_user_role(target_id) in ("admin", "owner")
+            or target_class not in (None, own_class)
+            or new_class not in (None, own_class)
+        ):
+            await message.answer(DENIED_USER)
+            return
+
     if new_class:
         set_user_class(target_id, new_class)
         await message.answer(
@@ -1036,10 +1223,10 @@ async def cmd_holiday(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    scope, rest = resolve_scope(command.args, message.from_user.id, allow_all=True)
-    if scope is None:
-        await message.answer(NEED_CLASS, parse_mode="HTML")
+    res = await get_scope(message, command.args, allow_all=True)
+    if res is None:
         return
+    scope, rest = res
 
     parts = rest.split(maxsplit=1)
     target = parse_date(parts[0]) if parts else None
@@ -1072,10 +1259,10 @@ async def cmd_change(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    scope, rest = resolve_scope(command.args, message.from_user.id)
-    if scope is None:
-        await message.answer(NEED_CLASS, parse_mode="HTML")
+    res = await get_scope(message, command.args)
+    if res is None:
         return
+    scope, rest = res
     class_id = scope[0]
 
     usage = (
@@ -1111,10 +1298,10 @@ async def cmd_changes(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    scope, _ = resolve_scope(command.args, message.from_user.id, allow_all=True)
-    if scope is None:
-        await message.answer(NEED_CLASS, parse_mode="HTML")
+    res = await get_scope(message, command.args, allow_all=True)
+    if res is None:
         return
+    scope, _ = res
 
     today = datetime.now(UZB_TZ).date().isoformat()
     lines = []
@@ -1146,10 +1333,10 @@ async def cmd_clear_change(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    scope, rest = resolve_scope(command.args, message.from_user.id, allow_all=True)
-    if scope is None:
-        await message.answer(NEED_CLASS, parse_mode="HTML")
+    res = await get_scope(message, command.args, allow_all=True)
+    if res is None:
         return
+    scope, rest = res
 
     words = rest.split()
     target = parse_date(words[0]) if words else None
@@ -1180,10 +1367,10 @@ async def cmd_set_lesson(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    scope, rest = resolve_scope(command.args, message.from_user.id)
-    if scope is None:
-        await message.answer(NEED_CLASS, parse_mode="HTML")
+    res = await get_scope(message, command.args)
+    if res is None:
         return
+    scope, rest = res
     class_id = scope[0]
 
     usage = (
@@ -1236,10 +1423,10 @@ async def cmd_del_lesson(message: types.Message, command: CommandObject):
     if not await require_admin(message):
         return
 
-    scope, rest = resolve_scope(command.args, message.from_user.id)
-    if scope is None:
-        await message.answer(NEED_CLASS, parse_mode="HTML")
+    res = await get_scope(message, command.args)
+    if res is None:
         return
+    scope, rest = res
     class_id = scope[0]
 
     words = rest.split()
