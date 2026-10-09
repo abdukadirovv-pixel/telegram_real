@@ -164,14 +164,22 @@ TEACHER_HELP = (
     "• <code>/stop</code> — barcha xabarlarni o'chirish"
 )
 
+_CLASS_BROADCASTS = "\n".join(
+    f"• <code>/broadcast_{cid} &lt;xabar&gt;</code> — {esc(cfg['name'])}" for cid, cfg in CLASSES.items()
+)
+
 ADMIN_HELP = (
     "🛠 <b>Admin buyruqlari</b>\n\n"
-    "• <code>/users</code> — foydalanuvchilar ro'yxati\n"
+    "• <code>/users [10a|10b|none|all]</code> — foydalanuvchilar (har sinf alohida oynada)\n"
     "• <code>/stats</code> — statistika\n"
     "• <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code>\n"
-    "• <code>/broadcast [sinf] &lt;xabar&gt;</code> — sinf yozilmasa hammaga\n"
     "• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>\n"
-    "• <code>/setclass &lt;user_id&gt; &lt;sinf&gt;</code> — foydalanuvchi sinfini o'zgartirish\n"
+    "• <code>/setclass &lt;user_id&gt; &lt;sinf&gt;</code> — foydalanuvchi sinfini o'zgartirish\n\n"
+    "📢 <b>Xabar yuborish</b>\n"
+    "• <code>/broadcast &lt;xabar&gt;</code> — hammaga\n"
+    "• <code>/broadcast_students &lt;xabar&gt;</code> — barcha talabalarga\n"
+    + _CLASS_BROADCASTS + "\n\n"
+    "📅 <b>Jadval</b>\n"
     "• <code>/holiday [sinf|all] &lt;sana&gt; [sabab]</code> — dars yo'q kuni\n"
     "• <code>/change [sinf] &lt;sana&gt; &lt;dars#&gt; &lt;matn&gt;</code> — darsga eslatma\n"
     "• <code>/changes [sinf|all]</code> — o'zgarishlar ro'yxati\n"
@@ -187,6 +195,8 @@ OWNER_HELP = (
     "• <code>/makeadmin &lt;user_id&gt;</code>\n"
     "• <code>/removeadmin &lt;user_id&gt;</code>\n"
     "• <code>/inbox on|off</code> — foydalanuvchi xabarlarini senga yuborish\n"
+    "• <code>/users teachers</code> — o'qituvchilar oynasi\n"
+    "• <code>/broadcast_teachers &lt;xabar&gt;</code> — faqat o'qituvchilarga\n"
     "• <code>/setteacher &lt;ism&gt; &lt;user_id&gt;</code> — o'qituvchi rejimini yoqish\n"
     "• <code>/removeteacher &lt;user_id&gt;</code> — o'qituvchi rejimini o'chirish\n"
     "• <code>/teachers</code> — o'qituvchilar ro'yxati"
@@ -627,33 +637,126 @@ async def cmd_admin_help(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 
-@router.message(Command("users"))
-async def cmd_list_users(message: types.Message):
-    if not await require_admin(message):
-        return
+# --- /users: a separate window for every class, for teachers and for people without a class ---
+USERS_PAGE_SIZE = 15
+USERS_SCOPES = ("none", "teachers", "all")
 
-    users = get_all_users()
-    if not users:
-        await message.answer("👥 Hozircha foydalanuvchilar yo'q.")
-        return
 
-    viewer_is_owner = message.from_user.id == OWNER_ID
-    lines = ["👥 <b>Foydalanuvchilar Ro'yxati:</b>\n"]
-    for u_id, uname, fname, role, is_active, banned, class_id, teacher_key in users:
+def users_menu_text() -> str:
+    return "👥 <b>Foydalanuvchilar</b>\nBo'limni tanlang:"
+
+
+def users_menu_keyboard(include_teachers: bool) -> InlineKeyboardMarkup:
+    class_buttons = [
+        InlineKeyboardButton(
+            text=f"🏫 {cfg['short']} ({count_users_in_scope(cid, include_teachers)})",
+            callback_data=f"usr:{cid}:0",
+        )
+        for cid, cfg in CLASSES.items()
+    ]
+    rows = [class_buttons[i:i + 2] for i in range(0, len(class_buttons), 2)]
+    rows.append([InlineKeyboardButton(
+        text=f"❓ Sinf tanlamagan ({count_users_in_scope('none', include_teachers)})",
+        callback_data="usr:none:0",
+    )])
+    if include_teachers:
+        rows.append([InlineKeyboardButton(
+            text=f"👨‍🏫 O'qituvchilar ({count_users_in_scope('teachers', True)})",
+            callback_data="usr:teachers:0",
+        )])
+    rows.append([InlineKeyboardButton(
+        text=f"👥 Hammasi ({count_users_in_scope('all', include_teachers)})",
+        callback_data="usr:all:0",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_users_window(scope: str, page: int, include_teachers: bool):
+    """Returns (text, keyboard) of one /users window (one page of one section)."""
+    rows = get_users_in_scope(scope, include_teachers)
+    total_pages = max(1, math.ceil(len(rows) / USERS_PAGE_SIZE))
+    page = min(max(page, 0), total_pages - 1)
+    chunk = rows[page * USERS_PAGE_SIZE:(page + 1) * USERS_PAGE_SIZE]
+
+    if scope in CLASSES:
+        title = f"🏫 {class_name(scope)}"
+    else:
+        title = {"none": "❓ Sinf tanlamagan", "teachers": "👨‍🏫 O'qituvchilar", "all": "👥 Hammasi"}[scope]
+
+    text = f"<b>{esc(title)}</b> — {len(rows)} ta\n"
+    if total_pages > 1:
+        text += f"({page + 1}/{total_pages}-sahifa)\n"
+    text += "\n"
+
+    if not chunk:
+        text += "Bu bo'limda foydalanuvchi yo'q."
+    for u_id, uname, fname, role, is_active, banned, class_id, teacher_key in chunk:
         name = esc(fname or "NoName")
         un = f"@{esc(uname)}" if uname and uname != "NoUsername" else "NoUsername"
         flags = (" 🚫" if banned else "") + (" 💤" if not is_active else "")
-        if viewer_is_owner and teacher_key in TEACHERS:
-            tag = f"👨‍🏫 {esc(TEACHERS[teacher_key]['short'])}"
-        else:
-            tag = "🏫 " + (CLASSES[class_id]["short"] if class_id in CLASSES else "—")
-        lines.append(f"• <b>{name}</b> ({un}) | ID: <code>{u_id}</code> | {tag} | <code>{role}</code>{flags}")
-    lines.append("\n🚫 — ban qilingan, 💤 — botni bloklagan, — — sinf tanlanmagan")
-    text = "\n".join(lines)
+        line = f"• <b>{name}</b> ({un}) | ID: <code>{u_id}</code> | <code>{role}</code>{flags}"
+        if scope == "all":  # mixed window: show where the person belongs
+            if include_teachers and teacher_key in TEACHERS:
+                line += f" | 👨‍🏫 {esc(TEACHERS[teacher_key]['short'])}"
+            else:
+                line += " | 🏫 " + (CLASSES[class_id]["short"] if class_id in CLASSES else "—")
+        text += line + "\n"
+    text += "\n🚫 — ban qilingan, 💤 — botni bloklagan"
 
-    # Telegram limit is 4096 chars per message
-    for i in range(0, len(text), 4000):
-        await message.answer(text[i:i + 4000], parse_mode="HTML")
+    keyboard_rows = []
+    if total_pages > 1:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="◀️", callback_data=f"usr:{scope}:{max(page - 1, 0)}"),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="usr:noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"usr:{scope}:{min(page + 1, total_pages - 1)}"),
+        ])
+    keyboard_rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="usr:menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+@router.message(Command("users"))
+async def cmd_list_users(message: types.Message, command: CommandObject):
+    """/users opens a menu; every class (and the teachers, owner only) has its own window.
+    Shortcuts: /users 10a, /users 10b, /users none, /users all, /users teachers (owner)."""
+    if not await require_admin(message):
+        return
+
+    include_teachers = get_user_role(message.from_user.id) == "owner"
+    arg = (command.args or "").strip().lower()
+    scope = class_token(arg) or {"none": "none", "all": "all", "hamma": "all", "teachers": "teachers"}.get(arg)
+    if scope == "teachers" and not include_teachers:
+        scope = None
+
+    if scope:
+        text, keyboard = render_users_window(scope, 0, include_teachers)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    await message.answer(
+        users_menu_text(), parse_mode="HTML", reply_markup=users_menu_keyboard(include_teachers)
+    )
+
+
+@router.callback_query(F.data.startswith("usr:"))
+async def cb_users(call: types.CallbackQuery):
+    if not is_admin_or_owner(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+
+    include_teachers = get_user_role(call.from_user.id) == "owner"
+    parts = call.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "menu":
+        await safe_edit(call, users_menu_text(), users_menu_keyboard(include_teachers))
+    elif action in CLASSES or action in USERS_SCOPES:
+        if action == "teachers" and not include_teachers:
+            await call.answer("⛔", show_alert=True)
+            return
+        page = parse_id(parts[2]) if len(parts) > 2 else 0
+        text, keyboard = render_users_window(action, page or 0, include_teachers)
+        await safe_edit(call, text, keyboard)
+    await call.answer()
 
 
 @router.message(Command("stats"))
@@ -725,35 +828,69 @@ async def cmd_direct_message(message: types.Message, command: CommandObject, bot
         await message.answer(f"❌ Yuborib bo'lmadi: {esc(e)}", parse_mode="HTML")
 
 
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: types.Message, command: CommandObject, bot: Bot):
-    if not await require_admin(message):
-        return
-
-    args = (command.args or "").strip()
-    parts = args.split(maxsplit=1)
-    target_class = class_token(parts[0]) if parts else None
-    body = (parts[1] if len(parts) > 1 else "") if target_class else args
-
-    if not body.strip():
+# --- BROADCASTS: a separate command for everybody / students / each class / teachers ---
+async def run_broadcast(message: types.Message, command: CommandObject, bot: Bot, audience: str, label: str):
+    body = (command.args or "").strip()
+    if not body:
         await message.answer(
-            "⚠️ Ishlatish: <code>/broadcast [sinf] &lt;xabar&gt;</code>\n"
-            "Masalan: <code>/broadcast 10a Ertaga dars 10:00 da</code>",
-            parse_mode="HTML"
+            f"⚠️ Ishlatish: <code>/{esc(command.command)} &lt;xabar&gt;</code>", parse_mode="HTML"
         )
         return
 
     text = f"📢 <b>E'lon:</b>\n\n{esc(body)}"
-    result = await broadcast_message(bot, text, flag="announcements", class_id=target_class)
-
-    target_label = class_name(target_class) if target_class else "Hammaga"
+    result = await broadcast_to(bot, text, audience)
     await message.answer(
-        f"📢 {esc(target_label)}\n"
+        f"📢 {esc(label)}\n"
         f"✅ Yuborildi: {result['ok']}\n"
         f"🚫 Bloklagan: {result['blocked']}\n"
         f"❌ Xatolik: {result['failed']}",
         parse_mode="HTML"
     )
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, command: CommandObject, bot: Bot):
+    """/broadcast <xabar>  -  everybody (students and teachers)."""
+    if not await require_admin(message):
+        return
+
+    first = (command.args or "").split(maxsplit=1)[0].lower() if command.args else ""
+    if class_token(first) or first in ("students", "teachers", "all"):
+        # safety: the old syntax '/broadcast 10a text' must not be sent to everybody by mistake
+        await message.answer(
+            "⚠️ <code>/broadcast</code> hammaga yuboradi. Alohida yuborish uchun:\n"
+            "• <code>/broadcast_students</code>\n"
+            + "\n".join(f"• <code>/broadcast_{cid}</code>" for cid in CLASSES),
+            parse_mode="HTML"
+        )
+        return
+
+    await run_broadcast(message, command, bot, "all", "Hammaga")
+
+
+@router.message(Command("broadcast_students"))
+async def cmd_broadcast_students(message: types.Message, command: CommandObject, bot: Bot):
+    """/broadcast_students <xabar>  -  all students of all classes (no teachers)."""
+    if not await require_admin(message):
+        return
+    await run_broadcast(message, command, bot, "students", "Barcha talabalar")
+
+
+@router.message(Command(*[f"broadcast_{cid}" for cid in CLASSES]))
+async def cmd_broadcast_class(message: types.Message, command: CommandObject, bot: Bot):
+    """/broadcast_10a <xabar>, /broadcast_10b <xabar>  -  one class only (generated from CLASSES)."""
+    if not await require_admin(message):
+        return
+    class_id = command.command.split("_", 1)[1].lower()
+    if class_id not in CLASSES:
+        return
+    await run_broadcast(message, command, bot, class_id, class_name(class_id))
+
+
+@router.message(Command("broadcast_teachers"), IsOwner())
+async def cmd_broadcast_teachers(message: types.Message, command: CommandObject, bot: Bot):
+    """/broadcast_teachers <xabar>  -  teachers only. Hidden: only the owner can use it."""
+    await run_broadcast(message, command, bot, "teachers", "O'qituvchilar")
 
 
 @router.message(Command("makeadmin"))

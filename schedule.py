@@ -599,6 +599,62 @@ def get_teacher_recipients(teacher_key: str, flag: str | None = None) -> list[in
     return [row[0] for row in cursor.fetchall()]
 
 
+def get_audience_recipients(audience: str, flag: str | None = "announcements") -> list[int]:
+    """Who gets a broadcast.
+    audience = 'all' (everybody) | 'students' (everybody except teachers) | 'teachers' | a class id ('10a')."""
+    query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
+    params: list = []
+    if audience == "students":
+        query += " AND teacher_key IS NULL"
+    elif audience == "teachers":
+        query += " AND teacher_key IS NOT NULL"
+    elif audience in CLASSES:
+        query += " AND teacher_key IS NULL AND class_id = ?"
+        params.append(audience)
+    elif audience != "all":
+        return []
+    if flag in SETTING_LABELS:
+        query += f" AND {flag} = 1"
+    cursor.execute(query, params)
+    return [row[0] for row in cursor.fetchall()]
+
+
+def users_scope_where(scope: str, include_teachers: bool):
+    """SQL filter of a /users window. scope = a class id | 'none' | 'teachers' | 'all'.
+    Teachers are only visible when include_teachers is True (= the viewer is the owner)."""
+    if scope == "teachers":
+        return ("teacher_key IS NOT NULL", []) if include_teachers else None
+    if scope == "none":
+        return "class_id IS NULL AND teacher_key IS NULL", []
+    if scope == "all":
+        return ("1 = 1" if include_teachers else "teacher_key IS NULL"), []
+    if scope in CLASSES:
+        return "class_id = ? AND teacher_key IS NULL", [scope]
+    return None
+
+
+def get_users_in_scope(scope: str, include_teachers: bool):
+    spec = users_scope_where(scope, include_teachers)
+    if spec is None:
+        return []
+    where, params = spec
+    cursor.execute(
+        "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key "
+        f"FROM users WHERE {where} ORDER BY first_name COLLATE NOCASE",
+        params,
+    )
+    return cursor.fetchall()
+
+
+def count_users_in_scope(scope: str, include_teachers: bool) -> int:
+    spec = users_scope_where(scope, include_teachers)
+    if spec is None:
+        return 0
+    where, params = spec
+    cursor.execute(f"SELECT COUNT(*) FROM users WHERE {where}", params)
+    return cursor.fetchone()[0]
+
+
 def get_settings(user_id: int) -> dict:
     cursor.execute(
         "SELECT morning_alert, lesson_alerts, announcements FROM users WHERE user_id = ?",
@@ -1057,6 +1113,16 @@ async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML",
 async def broadcast_message(bot: Bot, text: str, flag: str | None = None, class_id: str | None = None) -> dict:
     result = {"ok": 0, "blocked": 0, "failed": 0}
     for u_id in get_recipients(flag, class_id):
+        status = await safe_send(bot, u_id, text)
+        result[status] += 1
+        await asyncio.sleep(0.05)  # stay under Telegram rate limits
+    return result
+
+
+async def broadcast_to(bot: Bot, text: str, audience: str, flag: str | None = "announcements") -> dict:
+    """Admin broadcasts: audience = 'all' | 'students' | 'teachers' | a class id."""
+    result = {"ok": 0, "blocked": 0, "failed": 0}
+    for u_id in get_audience_recipients(audience, flag):
         status = await safe_send(bot, u_id, text)
         result[status] += 1
         await asyncio.sleep(0.05)  # stay under Telegram rate limits
