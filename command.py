@@ -61,8 +61,10 @@ def main_menu(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
-def day_keyboard() -> InlineKeyboardMarkup:
+def day_keyboard(class_id: str) -> InlineKeyboardMarkup:
     names = ["Du", "Se", "Ch", "Pa", "Ju"]
+    if 5 in class_timetable(class_id):   # classes with Saturday lessons also get an "Sh" button
+        names.append("Sh")
     row = [InlineKeyboardButton(text=n, callback_data=f"day:{i}") for i, n in enumerate(names)]
     today_row = [InlineKeyboardButton(text="📍 Bugun", callback_data="day:today")]
     return InlineKeyboardMarkup(inline_keyboard=[row, today_row])
@@ -100,8 +102,11 @@ CLASS_PROMPT = (
     "(Keyinroq o'zgartirish: /class)"
 )
 
+_CODES = "|".join(CLASSES)                                              # 10a|10b|10e
+_CODES_HTML = " yoki ".join(f"<code>{cid}</code>" for cid in CLASSES)   # <code>10a</code> yoki ...
+
 NEED_CLASS = (
-    "⚠️ Sinfni ko'rsating: <code>10a</code> yoki <code>10b</code> "
+    f"⚠️ Sinfni ko'rsating: {_CODES_HTML} "
     "(yoki /class orqali o'z sinfingizni tanlang)."
 )
 
@@ -175,7 +180,7 @@ _CLASS_BROADCASTS = "\n".join(
 
 ADMIN_HELP = (
     "🛠 <b>Admin buyruqlari</b>\n\n"
-    "• <code>/users [10a|10b|none|all]</code> — foydalanuvchilar (har sinf alohida oynada)\n"
+    f"• <code>/users [{_CODES}|none|all]</code> — foydalanuvchilar (har sinf alohida oynada)\n"
     "• <code>/stats</code> — statistika\n"
     "• <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code>\n"
     "• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>\n"
@@ -191,7 +196,7 @@ ADMIN_HELP = (
     "• <code>/clearchange [sinf|all] &lt;sana&gt;</code> — o'zgarishlarni o'chirish\n"
     "• <code>/setlesson [sinf] &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
     "• <code>/dellesson [sinf] &lt;kun&gt;</code> — kunning oxirgi darsini o'chirish\n"
-    "Sinf: <code>10a</code> yoki <code>10b</code> (yozilmasa — o'z sinfingiz).\n"
+    f"Sinf: {_CODES_HTML} (yozilmasa — o'z sinfingiz).\n"
     "Sana: <code>YYYY-MM-DD</code>, <code>bugun</code> yoki <code>ertaga</code>"
 )
 
@@ -461,7 +466,7 @@ async def cmd_schedule(message: types.Message):
     if len(args) > 1:
         query_arg = args[1].lower()
         if query_arg in DAY_CODE_MAP:
-            target = week_start(today) + timedelta(days=DAY_CODE_MAP[query_arg])
+            target = class_week_start(class_id, today) + timedelta(days=DAY_CODE_MAP[query_arg])
         else:
             await message.answer(
                 "❌ <b>Noto'g'ri kun kiritildi!</b>\n\n"
@@ -476,7 +481,7 @@ async def cmd_schedule(message: types.Message):
     else:
         target = today
 
-    await message.answer(format_date_schedule(class_id, target), parse_mode="HTML", reply_markup=day_keyboard())
+    await message.answer(format_date_schedule(class_id, target), parse_mode="HTML", reply_markup=day_keyboard(class_id))
 
 
 @router.message(Command("tomorrow"))
@@ -495,7 +500,7 @@ async def cmd_tomorrow(message: types.Message):
     class_id = await ensure_class(message)
     if not class_id:
         return
-    await message.answer(format_date_schedule(class_id, target), parse_mode="HTML", reply_markup=day_keyboard())
+    await message.answer(format_date_schedule(class_id, target), parse_mode="HTML", reply_markup=day_keyboard(class_id))
 
 
 @router.message(Command("week"))
@@ -514,7 +519,7 @@ async def cmd_week(message: types.Message):
     class_id = await ensure_class(message)
     if not class_id:
         return
-    await message.answer(format_week(class_id, week_start(today)), parse_mode="HTML")
+    await message.answer(format_week(class_id, class_week_start(class_id, today)), parse_mode="HTML")
 
 
 @router.message(Command("now"))
@@ -640,13 +645,13 @@ async def cb_day(call: types.CallbackQuery):
 
     if key == "today":
         target = today
-    elif key.isdigit() and 0 <= int(key) <= 4:
-        target = week_start(today) + timedelta(days=int(key))
+    elif key.isdigit() and 0 <= int(key) <= (5 if 5 in class_timetable(class_id) else 4):
+        target = class_week_start(class_id, today) + timedelta(days=int(key))
     else:
         await call.answer()
         return
 
-    await safe_edit(call, format_date_schedule(class_id, target), day_keyboard())
+    await safe_edit(call, format_date_schedule(class_id, target), day_keyboard(class_id))
     await call.answer()
 
 
@@ -1376,7 +1381,7 @@ async def cmd_set_lesson(message: types.Message, command: CommandObject):
     usage = (
         "⚠️ Ishlatish: <code>/setlesson [sinf] &lt;kun&gt; &lt;dars#&gt; &lt;fan&gt;; &lt;xona&gt;; &lt;o'qituvchilar&gt;</code>\n"
         "Masalan: <code>/setlesson 10a 1 3 Ona tili; 210; Barno</code>\n"
-        "Kun: 1-5 yoki du/se/ch/pa/ju"
+        "Kun: 1-6 yoki du/se/ch/pa/ju/sh"
     )
     parts = rest.split(maxsplit=2)
     if len(parts) < 3:
@@ -1433,7 +1438,7 @@ async def cmd_del_lesson(message: types.Message, command: CommandObject):
     day_idx = DAY_CODE_MAP.get(words[0].lower()) if words else None
     if day_idx is None:
         await message.answer(
-            "⚠️ Ishlatish: <code>/dellesson [sinf] &lt;kun&gt;</code> (kun: 1-5 yoki du/se/ch/pa/ju)",
+            "⚠️ Ishlatish: <code>/dellesson [sinf] &lt;kun&gt;</code> (kun: 1-6 yoki du/se/ch/pa/ju/sh)",
             parse_mode="HTML"
         )
         return
