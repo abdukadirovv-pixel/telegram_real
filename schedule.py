@@ -163,6 +163,7 @@ DAY_NAMES = {
     2: "Chorshanba (Wednesday)",
     3: "Payshanba (Thursday)",
     4: "Juma (Friday)",
+    5: "Shanba (Saturday)",
 }
 
 DAY_CODE_MAP = {
@@ -171,11 +172,12 @@ DAY_CODE_MAP = {
     "3": 2, "ch": 2, "chorshanba": 2, "wed": 2, "wednesday": 2,
     "4": 3, "pa": 3, "payshanba": 3, "thu": 3, "thursday": 3,
     "5": 4, "ju": 4, "juma": 4, "fri": 4, "friday": 4,
+    "6": 5, "sh": 5, "shanba": 5, "sat": 5, "saturday": 5,
 }
 
-# Teachers also work on Saturday
-TEACHER_DAY_NAMES = {**DAY_NAMES, 5: "Shanba (Saturday)"}
-TEACHER_DAY_CODE_MAP = {**DAY_CODE_MAP, "6": 5, "sh": 5, "shanba": 5, "sat": 5, "saturday": 5}
+# Classes (like 10-E) and teachers can have Saturday lessons, so they share the same day tables
+TEACHER_DAY_NAMES = DAY_NAMES
+TEACHER_DAY_CODE_MAP = DAY_CODE_MAP
 
 # ======================================================================
 #  CLASSES  (add a new class = add one block here, nothing else changes)
@@ -289,6 +291,57 @@ DEFAULT_TIMETABLE_10A = {
     ],
 }
 
+# --- 10-E umumta'lim ---
+# The printout starts at 8:30, but the bot uses the SAME bell times as the other classes (start 09:00).
+BELLS_10E = [dict(b) for b in BELLS_10B]
+
+DEFAULT_TIMETABLE_10E = {
+    0: [  # 1 - Dushanba
+        {"subject": "Kelajak soati", "room": "129", "teachers": "Zebo"},
+        {"subject": "Fizika", "room": "129", "teachers": "Risolat"},
+        {"subject": "Rus tili", "room": "129", "teachers": "Gulnora"},
+        {"subject": "Algebra", "room": "129", "teachers": "Durdona"},
+        {"subject": "Geometriya", "room": "129", "teachers": "Durdona"},
+        {"subject": "Ingliz tili", "room": "129", "teachers": "Muzaffar"},
+    ],
+    1: [  # 2 - Seshanba
+        {"subject": "Kimyo", "room": "129", "teachers": "Umid"},
+        {"subject": "Informatika", "room": "203", "teachers": "Feruza"},
+        {"subject": "Biologiya", "room": "129", "teachers": "Zebo"},
+        {"subject": "Geografiya", "room": "223", "teachers": "Mamura"},
+        {"subject": "Tarbiya", "room": "129", "teachers": "Azada"},
+    ],
+    2: [  # 3 - Chorshanba
+        {"subject": "Ona tili", "room": "129", "teachers": "Nazokat"},
+        {"subject": "CHQBT", "room": "129", "teachers": "To'lqin"},
+        {"subject": "O'zbek tarix", "room": "129", "teachers": "Nazokat"},
+        {"subject": "Geografiya", "room": "223", "teachers": "Mamura"},
+        {"subject": "Rus tili", "room": "129", "teachers": "Gulnora"},
+    ],
+    3: [  # 4 - Payshanba
+        {"subject": "Ingliz tili", "room": "129", "teachers": "Muzaffar"},
+        {"subject": "Algebra", "room": "129", "teachers": "Durdona"},
+        {"subject": "Kimyo", "room": "129", "teachers": "Umid"},
+        {"subject": "Huquq", "room": "129", "teachers": "Azada"},
+        {"subject": "CHQBT", "room": "129", "teachers": "To'lqin"},
+        {"subject": "Adabiyot", "room": "N/A", "teachers": "Nazokat"},
+    ],
+    4: [  # 5 - Juma
+        {"subject": "Informatika", "room": "203", "teachers": "Feruza"},
+        {"subject": "Fizika", "room": "129", "teachers": "Risolat"},
+        {"subject": "Jahon tarix", "room": "129", "teachers": "Nazokat"},
+        {"subject": "Biologiya", "room": "129", "teachers": "Zebo"},
+        {"subject": "Ona tili", "room": "129", "teachers": "Nazokat"},
+        {"subject": "Adabiyot", "room": "N/A", "teachers": "Nazokat"},
+    ],
+    5: [  # 6 - Shanba
+        {"subject": "Algebra", "room": "129", "teachers": "Durdona"},
+        {"subject": "Geometriya", "room": "129", "teachers": "Durdona"},
+        {"subject": "Jismoniy tarbiya", "room": "Sport zal", "teachers": "Dilshod"},
+        {"subject": "Jismoniy tarbiya", "room": "Sport zal", "teachers": "Dilshod"},
+    ],
+}
+
 # "morning" = time of the morning alert
 CLASSES = {
     "10a": {
@@ -304,6 +357,13 @@ CLASSES = {
         "morning": "08:00",
         "bells": BELLS_10B,
         "default": DEFAULT_TIMETABLE_10B,
+    },
+    "10e": {
+        "name": "10-E umumta'lim",
+        "short": "10-E",
+        "morning": "08:00",
+        "bells": BELLS_10E,
+        "default": DEFAULT_TIMETABLE_10E,
     },
 }
 
@@ -805,6 +865,16 @@ def teacher_week_start(today: date) -> date:
     return today - timedelta(days=wd) if wd < 6 else today + timedelta(days=1)
 
 
+def class_week_start(class_id: str, today: date) -> date:
+    """Monday of the week to show for a class. Sunday always shows the coming week; Saturday does too,
+    unless the class has Saturday lessons (then the current week is still in progress)."""
+    wd = today.weekday()
+    has_saturday = 5 in class_timetable(class_id)
+    if wd == 6 or (wd == 5 and not has_saturday):
+        return today + timedelta(days=7 - wd)
+    return today - timedelta(days=wd)
+
+
 def get_off_reason(class_id: str, d: date) -> str | None:
     """Returns the reason if the day is marked 'no school' for this class, otherwise None."""
     cursor.execute(
@@ -899,7 +969,7 @@ def format_week(class_id: str, start: date) -> str:
     timetable = class_timetable(class_id)
     bells = class_bells(class_id)
     text = f"🗓 <b>Haftalik jadval</b> · {esc(class_name(class_id))}\n\n"
-    for wd in range(5):
+    for wd in range(6 if 5 in timetable else 5):
         d = start + timedelta(days=wd)
         text += f"<b>{esc(DAY_NAMES[wd])}</b> ({d.strftime('%d.%m')})"
         off = get_off_reason(class_id, d)
