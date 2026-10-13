@@ -45,18 +45,19 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=UZB_TZ)
 
     for class_id, cfg in CLASSES.items():
-        # 1. Morning schedule alert (Mon-Fri)
+        # 1. Morning schedule alert (Mon-Sat; on days without lessons the job simply does nothing,
+        #    so classes with Saturday lessons like 10-E work without extra settings)
         m_hour, m_minute = map(int, cfg["morning"].split(":"))
         scheduler.add_job(
-            send_morning_alert, "cron", day_of_week="mon-fri",
+            send_morning_alert, "cron", day_of_week="mon-sat",
             hour=m_hour, minute=m_minute, args=[bot, class_id],
         )
 
-        # 2. Lesson end alerts (Mon-Fri) matching the bell schedule of the class
+        # 2. Lesson end alerts (Mon-Sat) matching the bell schedule of the class
         for bell in cfg["bells"]:
             e_hour, e_minute = map(int, bell["end"].split(":"))
             scheduler.add_job(
-                send_lesson_end_alert, "cron", day_of_week="mon-fri",
+                send_lesson_end_alert, "cron", day_of_week="mon-sat",
                 hour=e_hour, minute=e_minute, args=[bot, class_id, bell["lesson"]],
             )
 
