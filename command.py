@@ -77,9 +77,17 @@ def teacher_day_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[row, today_row])
 
 
-def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
+def settings_labels(user_id: int) -> dict:
+    """Button labels of /settings. For teachers the lesson alert is a reminder BEFORE each lesson."""
+    labels = dict(SETTING_LABELS)
+    if get_user_teacher(user_id):
+        labels["lesson_alerts"] = "🔔 Dars eslatmalari"
+    return labels
+
+
+def settings_keyboard(settings: dict, labels: dict | None = None) -> InlineKeyboardMarkup:
     rows = []
-    for key, label in SETTING_LABELS.items():
+    for key, label in (labels or SETTING_LABELS).items():
         mark = "✅" if settings.get(key) else "❌"
         rows.append([InlineKeyboardButton(text=f"{mark} {label}", callback_data=f"set:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -137,7 +145,8 @@ def teacher_welcome_text(teacher_key: str) -> str:
     return (
         f"👋 <b>Xush kelibsiz, {esc(cfg['short'])} ustoz!</b>\n"
         "👨‍🏫 Siz o'qituvchi sifatida ulandingiz.\n\n"
-        "☀️ Har kuni soat 08:00 da shu kungi darslaringiz haqida xabar olasiz.\n\n"
+        "☀️ Har kuni soat 08:00 da shu kungi darslaringiz haqida xabar olasiz.\n"
+        f"⏰ Har bir darsdan {cfg.get('remind_before', 5)} daqiqa oldin qaysi sinfga kirishingiz haqida eslatma olasiz.\n\n"
         "• Bugungi darslar: <code>/schedule</code>\n"
         "• Ertangi darslar: <code>/tomorrow</code>\n"
         "• Haftalik darslar: <code>/week</code>\n"
@@ -587,7 +596,7 @@ async def cmd_settings(message: types.Message):
     await message.answer(
         "⚙️ <b>Sozlamalar</b>\nQaysi xabarlarni olishni tanlang (tugmani bosib yoqing/o'chiring):",
         parse_mode="HTML",
-        reply_markup=settings_keyboard(get_settings(message.from_user.id)),
+        reply_markup=settings_keyboard(get_settings(message.from_user.id), settings_labels(message.from_user.id)),
     )
 
 
@@ -690,7 +699,9 @@ async def cb_settings(call: types.CallbackQuery):
     conn.commit()
 
     try:
-        await call.message.edit_reply_markup(reply_markup=settings_keyboard(get_settings(call.from_user.id)))
+        await call.message.edit_reply_markup(
+            reply_markup=settings_keyboard(get_settings(call.from_user.id), settings_labels(call.from_user.id))
+        )
     except TelegramBadRequest:
         pass
     await call.answer("Saqlandi ✅")
