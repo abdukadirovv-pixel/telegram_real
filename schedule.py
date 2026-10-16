@@ -423,6 +423,7 @@ TEACHERS = {
         "short": "Umarbek",
         "subject": "Informatika",
         "morning": "08:00",
+        "remind_before": 5,             # minutes before EVERY lesson: "you are going to teach class X"
         "default": TIMETABLE_UMARBEK,   # copied into the database on the first run only
         "timetable": {},                # live timetable, loaded from the database
     },
@@ -1379,5 +1380,37 @@ async def send_teacher_morning(bot: Bot, teacher_key: str):
         text += "\n\n" + teacher_next_text(teacher_key, now)
 
     for user_id in get_teacher_recipients(teacher_key, "morning_alert"):
+        await safe_send(bot, user_id, text)
+        await asyncio.sleep(0.05)
+
+
+async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: int):
+    """Sent a few minutes BEFORE every lesson of a teacher: which class he is going to teach.
+    For back-to-back lessons it arrives right when the previous lesson ends."""
+    today = datetime.now(UZB_TZ).date()
+    lessons = teacher_lessons(teacher_key, today)
+    item = next((l for l in lessons if l["lesson"] == lesson_num), None)
+    if item is None:          # no lesson in this slot today (or it was cancelled)
+        return
+
+    cfg = TEACHERS[teacher_key]
+    bell = teacher_bell(lesson_num)
+    lead = cfg.get("remind_before", 5)
+    text = (
+        f"⏰ <b>{fmt_minutes(lead)}dan keyin dars!</b>\n"
+        f"🏫 Sinf: <b>{esc(item['class'])}</b>\n"
+        f"🕘 {lesson_num}-dars ({bell['start']} - {bell['end']})"
+    )
+    if item["subject"] != cfg["subject"]:
+        text += f"\n📚 {esc(item['subject'])}"
+    previous = next((l for l in lessons if l["lesson"] == lesson_num - 1), None)
+    if previous and previous["class"] == item["class"]:
+        text += "\n🔁 Oldingi dars bilan bir xil sinf"
+    if item.get("class_id"):
+        note = get_notes(item["class_id"], today).get(lesson_num)
+        if note:
+            text += f"\n⚠️ <b>{esc(note)}</b>"
+
+    for user_id in get_teacher_recipients(teacher_key, "lesson_alerts"):
         await safe_send(bot, user_id, text)
         await asyncio.sleep(0.05)
