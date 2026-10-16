@@ -10,6 +10,7 @@ Run:  python main.py
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, types
 from aiohttp import web  # already installed together with aiogram
@@ -19,11 +20,13 @@ from schedule import (
     BOT_TOKEN,
     CLASSES,
     OWNER_ID,
+    TEACHER_BELLS,
     TEACHERS,
     UZB_TZ,
     is_banned,
     send_lesson_end_alert,
     send_morning_alert,
+    send_teacher_lesson_reminder,
     send_teacher_morning,
 )
 from command import router
@@ -42,7 +45,11 @@ class BanMiddleware(BaseMiddleware):
 
 # --- SCHEDULER (one set of jobs per class + one per teacher) ---
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone=UZB_TZ)
+    # misfire_grace_time: a job that starts up to 2 minutes late (busy server) is still sent, not skipped
+    scheduler = AsyncIOScheduler(
+        timezone=UZB_TZ,
+        job_defaults={"misfire_grace_time": 120, "coalesce": True},
+    )
 
     for class_id, cfg in CLASSES.items():
         # 1. Morning schedule alert (Mon-Sat; on days without lessons the job simply does nothing,
@@ -61,13 +68,24 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
                 hour=e_hour, minute=e_minute, args=[bot, class_id, bell["lesson"]],
             )
 
-    # 3. Teachers: morning warning with their lessons (Mon-Sat, teachers also work on Saturday)
+    # 3. Teachers (Mon-Sat, teachers also work on Saturday)
     for teacher_key, cfg in TEACHERS.items():
+        # 3a. morning message with all lessons of the day
         t_hour, t_minute = map(int, cfg["morning"].split(":"))
         scheduler.add_job(
             send_teacher_morning, "cron", day_of_week="mon-sat",
             hour=t_hour, minute=t_minute, args=[bot, teacher_key],
         )
+
+        # 3b. a reminder a few minutes BEFORE every lesson slot: "you are going to teach class X".
+        #     Slots where the teacher has no lesson are skipped inside the job itself.
+        lead = cfg.get("remind_before", 5)
+        for bell in TEACHER_BELLS:
+            remind_at = datetime.strptime(bell["start"], "%H:%M") - timedelta(minutes=lead)
+            scheduler.add_job(
+                send_teacher_lesson_reminder, "cron", day_of_week="mon-sat",
+                hour=remind_at.hour, minute=remind_at.minute, args=[bot, teacher_key, bell["lesson"]],
+            )
 
     return scheduler
 
