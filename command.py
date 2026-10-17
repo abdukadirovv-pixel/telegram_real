@@ -243,7 +243,7 @@ OWNER_HELP = (
     "• <code>/setteacher &lt;ism&gt; &lt;user_id&gt;</code> — o'qituvchi rejimini yoqish\n"
     "• <code>/removeteacher &lt;user_id&gt;</code> — o'qituvchi rejimini o'chirish\n"
     "• <code>/teachers</code> — o'qituvchilar ro'yxati\n"
-    "• <code>/setteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt; &lt;sinf&gt;; [fan]</code> — o'qituvchiga dars qo'shish / almashtirish\n"
+    "• <code>/setteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt; &lt;sinf&gt;; [fan]; [xona]</code> — o'qituvchiga dars qo'shish / almashtirish\n"
     "• <code>/delteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt;</code> — o'qituvchi darsini o'chirish\n"
     "• <code>/teacherweek [ism]</code> — o'qituvchining saqlangan jadvali"
 )
@@ -1581,9 +1581,10 @@ async def cmd_set_teacher_lesson(message: types.Message, command: CommandObject)
         return
 
     usage = (
-        "⚠️ Ishlatish: <code>/setteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt; &lt;sinf&gt;; [fan]</code>\n"
-        "Masalan: <code>/setteacherlesson umarbek 1 3 9-A aniq; Informatika</code>\n"
-        "Kun: 1-6 yoki du/se/ch/pa/ju/sh. Dars#: 1-8. Fan yozilmasa — o'qituvchining asosiy fani."
+        "⚠️ Ishlatish: <code>/setteacherlesson [ism] &lt;kun&gt; &lt;dars#&gt; &lt;sinf&gt;; [fan]; [xona]</code>\n"
+        "Masalan: <code>/setteacherlesson umarbek 1 3 9-A aniq; Informatika; 204</code>\n"
+        "Kun: 1-6 yoki du/se/ch/pa/ju/sh. Dars#: 1-8. Fan yozilmasa — o'qituvchining asosiy fani "
+        "(o'tkazib yuborish: <code>9-A aniq; ; 204</code>)."
     )
     parts = rest.split(maxsplit=2)
     if len(parts) < 3:
@@ -1599,25 +1600,27 @@ async def cmd_set_teacher_lesson(message: types.Message, command: CommandObject)
     fields = [f.strip() for f in parts[2].split(";")]
     class_label = fields[0]
     subject = fields[1] if len(fields) > 1 and fields[1] else TEACHERS[teacher_key]["subject"]
+    room = fields[2] if len(fields) > 2 and fields[2] else None
     if not class_label:
         await message.answer(usage, parse_mode="HTML")
         return
 
     existed = any(item["lesson"] == lesson for item in TEACHERS[teacher_key]["timetable"].get(day_idx, []))
     cursor.execute(
-        "INSERT OR REPLACE INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (teacher_key, day_idx, lesson, class_label, class_id_from_label(class_label), subject),
+        "INSERT OR REPLACE INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject, room) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (teacher_key, day_idx, lesson, class_label, class_id_from_label(class_label), subject, room),
     )
     conn.commit()
     load_teacher_timetables()
 
     bell = teacher_bell(lesson)
     status = "🔄 Almashtirildi" if existed else "✅ Qo'shildi"
+    room_line = f"\n🚪 Xona: {esc(room)}" if room else ""
     await message.answer(
         f"{status}: {esc(TEACHERS[teacher_key]['short'])} · "
         f"{esc(TEACHER_DAY_NAMES[day_idx])}, {lesson}-dars ({bell['start']} - {bell['end']})\n"
-        f"🏫 <b>{esc(class_label)}</b> — {esc(subject)}",
+        f"🏫 <b>{esc(class_label)}</b> — {esc(subject)}{room_line}",
         parse_mode="HTML"
     )
 
