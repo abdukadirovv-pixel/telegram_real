@@ -120,9 +120,11 @@ cursor.execute("""
         class_label TEXT,
         class_id TEXT,
         subject TEXT,
+        room TEXT,
         PRIMARY KEY (teacher_key, day, lesson)
     )
 """)
+ensure_column("teacher_timetable", "room", "TEXT")   # databases made by an older version get the column
 conn.commit()
 
 # Notification settings users can toggle in /settings
@@ -374,10 +376,11 @@ CLASSES = {
 TEACHER_BELLS = [dict(b) for b in BELLS_10A]  # 8 slots
 
 
-def _tl(lesson: int, klass: str, class_id: str | None = None, subject: str = "Informatika") -> dict:
-    """One teacher lesson. class_id is set only for classes that exist in the bot (10a / 10b)
+def _tl(lesson: int, klass: str, class_id: str | None = None, subject: str = "Informatika",
+        room: str | None = None) -> dict:
+    """One teacher lesson. class_id is set only for classes that exist in the bot (10a / 10b / 10e)
     so a holiday of that class also cancels the lesson for the teacher."""
-    return {"lesson": lesson, "class": klass, "class_id": class_id, "subject": subject}
+    return {"lesson": lesson, "class": klass, "class_id": class_id, "subject": subject, "room": room}
 
 
 # Madrimov Umarbek (ICT teacher)
@@ -417,6 +420,92 @@ TIMETABLE_UMARBEK = {
     ],
 }
 
+# Saidova O'g'iljon (physics) - lessons with rooms
+def _ph(lesson: int, klass: str, room: str, class_id: str | None = None) -> dict:
+    return _tl(lesson, klass, class_id, "Fizika", room)
+
+
+TIMETABLE_OGILJON = {
+    0: [  # Dushanba
+        _ph(1, "11-A aniq", "202"),
+        _ph(2, "10-B sinf (1-kichik guruh)", "Dežurka", "10b"),
+        _ph(3, "8-A aniq", "206"),
+        _ph(5, "7-B aniq", "202"),
+        _ph(6, "11-A aniq", "202"),
+        _ph(8, "10-A aniq", "202", "10a"),
+    ],
+    1: [  # Seshanba
+        _ph(2, "11-B aniq", "206"),
+        _ph(3, "11-A aniq", "202"),
+        _ph(4, "10-A aniq", "202", "10a"),
+        _ph(5, "8-A aniq", "206"),
+        _ph(6, "9-D tabiiy", "202"),
+        _ph(7, "10-B aniq", "207", "10b"),
+    ],
+    2: [  # Chorshanba
+        _ph(1, "10-A aniq", "202", "10a"),
+        _ph(2, "11-A aniq", "202"),
+        _ph(3, "10-B aniq", "207", "10b"),
+        _ph(5, "7-B aniq", "207"),
+        _ph(8, "11-B aniq", "202"),
+    ],
+    3: [  # Payshanba
+        _ph(1, "10-A aniq", "202", "10a"),
+        _ph(2, "10-B aniq", "207", "10b"),
+        _ph(3, "8-A aniq", "202"),
+        _ph(4, "11-B aniq", "206"),
+        _ph(5, "11-B aniq", "206"),
+        _ph(6, "11-A aniq", "202"),
+    ],
+    4: [  # Juma
+        _ph(2, "11-A aniq", "202"),
+        _ph(4, "10-B aniq", "202", "10b"),
+        _ph(5, "7-B aniq", "202"),
+        _ph(6, "10-A aniq", "202", "10a"),
+        _ph(7, "11-B aniq", "202"),
+    ],
+}
+
+
+# Olloyorov Muhammadsodiq (maths): "Matematika" in grades 1-6, from grade 7 it is split into
+# "Algebra" and "Geometriya". Every lesson is in room 217.
+def _math(lesson: int, klass: str, subject: str, class_id: str | None = None) -> dict:
+    return _tl(lesson, klass, class_id, subject, "217")
+
+
+TIMETABLE_MUHAMMADSODIQ = {
+    0: [  # 1-kun: Dushanba
+        _math(1, "10-B", "Algebra", "10b"),
+        _math(2, "6-A", "Matematika"),
+        _math(3, "11-B", "Algebra"),
+        _math(4, "11-B", "Geometriya"),
+    ],
+    1: [  # 2-kun: Seshanba
+        _math(1, "6-A", "Matematika"),
+        _math(2, "6-A", "Matematika"),
+        _math(3, "10-B", "Algebra", "10b"),
+        _math(4, "10-B", "Geometriya", "10b"),
+    ],
+    2: [  # 3-kun: Chorshanba
+        _math(1, "6-B", "Matematika"),
+        _math(2, "10-B", "Algebra", "10b"),
+        _math(3, "11-B", "Algebra"),
+        _math(4, "11-B", "Geometriya"),
+    ],
+    3: [  # 4-kun: Payshanba
+        _math(1, "6-A", "Matematika"),
+        _math(2, "6-A", "Matematika"),
+        _math(3, "10-B", "Algebra", "10b"),
+        _math(4, "10-B", "Geometriya", "10b"),
+    ],
+    4: [  # 5-kun: Juma
+        _math(1, "6-A", "Matematika"),
+        _math(2, "10-B", "Geometriya", "10b"),
+        _math(3, "11-B", "Algebra"),
+        _math(4, "11-B", "Geometriya"),
+    ],
+}
+
 TEACHERS = {
     "umarbek": {
         "name": "Madrimov Umarbek",
@@ -426,6 +515,27 @@ TEACHERS = {
         "remind_before": 5,             # minutes before EVERY lesson: "you are going to teach class X"
         "default": TIMETABLE_UMARBEK,   # copied into the database on the first run only
         "timetable": {},                # live timetable, loaded from the database
+    },
+    "ogiljon": {
+        "name": "Saidova O'g'iljon",
+        "short": "O'g'iljon",
+        "subject": "Fizika",
+        "morning": "08:00",
+        "remind_before": 5,
+        "aliases": ["o'g'lijon"],       # other spelling of the name
+        "default": TIMETABLE_OGILJON,
+        "timetable": {},
+    },
+    "muhammadsodiq": {
+        "name": "Olloyorov Muhammadsodiq",
+        "short": "Muhammadsodiq",
+        "subject": "Matematika",
+        "always_show_subject": True,    # he teaches Matematika / Algebra / Geometriya: always show which one
+        "morning": "08:00",
+        "remind_before": 5,
+        "aliases": ["sodiq"],
+        "default": TIMETABLE_MUHAMMADSODIQ,
+        "timetable": {},
     },
 }
 
@@ -506,9 +616,10 @@ def seed_teacher_if_needed(teacher_key: str):
         for day, lessons in TEACHERS[teacher_key]["default"].items():
             for item in lessons:
                 cursor.execute(
-                    "INSERT INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (teacher_key, day, item["lesson"], item["class"], item["class_id"], item["subject"]),
+                    "INSERT INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject, room) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (teacher_key, day, item["lesson"], item["class"], item["class_id"], item["subject"],
+                     item.get("room")),
                 )
         conn.commit()
     set_setting(f"seeded_teacher_{teacher_key}", "1")
@@ -518,13 +629,13 @@ def load_teacher_timetables():
     """Reloads the lessons of every teacher from the database."""
     fresh: dict[str, dict[int, list[dict]]] = {key: {} for key in TEACHERS}
     cursor.execute(
-        "SELECT teacher_key, day, lesson, class_label, class_id, subject FROM teacher_timetable "
+        "SELECT teacher_key, day, lesson, class_label, class_id, subject, room FROM teacher_timetable "
         "ORDER BY teacher_key, day, lesson"
     )
-    for key, day, lesson, class_label, class_id, subject in cursor.fetchall():
+    for key, day, lesson, class_label, class_id, subject, room in cursor.fetchall():
         if key in fresh:
             fresh[key].setdefault(day, []).append(
-                {"lesson": lesson, "class": class_label, "class_id": class_id, "subject": subject}
+                {"lesson": lesson, "class": class_label, "class_id": class_id, "subject": subject, "room": room}
             )
     for key in TEACHERS:
         TEACHERS[key]["timetable"] = fresh[key]
@@ -562,14 +673,19 @@ def class_id_from_label(label: str) -> str | None:
     return class_token(words[0]) if words else None
 
 
+def _plain(text: str) -> str:
+    """Lower case without apostrophes: O'g'iljon = o’g’iljon = ogiljon."""
+    return text.lower().translate(str.maketrans("", "", "'`ʻʼ’‘"))
+
+
 def teacher_token(raw: str | None) -> str | None:
-    """'Umarbek', 'umarbek', 'Madrimov' -> 'umarbek' (None if unknown)."""
+    """'Umarbek', "O'g'iljon", 'saidova', 'Muhammadsodiq' -> the teacher key (None if unknown)."""
     if not raw:
         return None
-    token = raw.lower()
+    token = _plain(raw)
     for key, cfg in TEACHERS.items():
-        names = [key, cfg["short"].lower()] + cfg["name"].lower().split()
-        if token in names:
+        names = [key, cfg["short"]] + cfg["name"].split() + cfg.get("aliases", [])
+        if token in [_plain(n) for n in names]:
             return key
     return None
 
@@ -1127,11 +1243,24 @@ def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
     return result
 
 
+def _subject_shown(teacher_key: str, item: dict) -> bool:
+    """Show the subject of a teacher lesson? Always for teachers with several subjects
+    (Matematika / Algebra / Geometriya), otherwise only when it differs from the main subject."""
+    cfg = TEACHERS[teacher_key]
+    return bool(cfg.get("always_show_subject")) or item["subject"] != cfg["subject"]
+
+
+def _room_text(item: dict) -> str:
+    return f"🚪 Xona: {esc(item['room'])}" if item.get("room") else ""
+
+
 def _teacher_line(teacher_key: str, d: date, item: dict) -> str:
     bell = teacher_bell(item["lesson"])
     line = f"<b>{item['lesson']}-dars ({bell['start']} - {bell['end']}):</b> {esc(item['class'])}"
-    if item["subject"] != TEACHERS[teacher_key]["subject"]:
+    if _subject_shown(teacher_key, item):
         line += f" — {esc(item['subject'])}"
+    if item.get("room"):
+        line += f" | {_room_text(item)}"
     line += "\n"
     if item.get("class_id"):
         note = get_notes(item["class_id"], d).get(item["lesson"])
@@ -1166,7 +1295,12 @@ def format_teacher_week(teacher_key: str, start: date) -> str:
             text += "—\n\n"
             continue
         for item in lessons:
-            text += f"{item['lesson']}. {esc(item['class'])}\n"
+            line = f"{item['lesson']}. {esc(item['class'])}"
+            if _subject_shown(teacher_key, item):
+                line += f" — {esc(item['subject'])}"
+            if item.get("room"):
+                line += f" ({esc(item['room'])})"
+            text += line + "\n"
         text += "\n"
     return text
 
@@ -1184,8 +1318,10 @@ def format_teacher_timetable(teacher_key: str) -> str:
         for item in lessons:
             bell = teacher_bell(item["lesson"])
             line = f"{item['lesson']}. ({bell['start']}-{bell['end']}) {esc(item['class'])}"
-            if item["subject"] != cfg["subject"]:
+            if _subject_shown(teacher_key, item):
                 line += f" — {esc(item['subject'])}"
+            if item.get("room"):
+                line += f" | 🚪 {esc(item['room'])}"
             text += line + "\n"
         text += "\n"
     return text
@@ -1221,8 +1357,10 @@ def _teacher_next_block(teacher_key: str, nxt, now: datetime) -> str:
     if d == now.date():
         mins = math.ceil((start - now).total_seconds() / 60)
         text += f" ({fmt_minutes(mins)}dan keyin)"
-    if item["subject"] != TEACHERS[teacher_key]["subject"]:
+    if _subject_shown(teacher_key, item):
         text += f"\n📚 {esc(item['subject'])}"
+    if item.get("room"):
+        text += f"\n{_room_text(item)}"
     if item.get("class_id"):
         note = get_notes(item["class_id"], d).get(item["lesson"])
         if note:
@@ -1251,8 +1389,10 @@ def teacher_now_text(teacher_key: str, now: datetime) -> str:
             f"🕘 {item['lesson']}-dars ({bell['start']} - {bell['end']})\n"
             f"⏳ Tugashiga {fmt_minutes(left)} qoldi"
         )
-        if item["subject"] != TEACHERS[teacher_key]["subject"]:
+        if _subject_shown(teacher_key, item):
             text += f"\n📚 {esc(item['subject'])}"
+        if item.get("room"):
+            text += f"\n{_room_text(item)}"
         if item.get("class_id"):
             note = get_notes(item["class_id"], now.date()).get(item["lesson"])
             if note:
@@ -1375,6 +1515,8 @@ async def send_teacher_morning(bot: Bot, teacher_key: str):
     """08:00 warning for a teacher: which classes he teaches today (or that he is free)."""
     now = datetime.now(UZB_TZ)
     cfg = TEACHERS[teacher_key]
+    if now.weekday() == 5 and not cfg["timetable"].get(5):
+        return  # this teacher does not teach on Saturdays: no message
     text = f"☀️ <b>Xayrli tong, {esc(cfg['short'])} ustoz!</b>\n\n" + format_teacher_day(teacher_key, now.date())
     if not teacher_lessons(teacher_key, now.date()):
         text += "\n\n" + teacher_next_text(teacher_key, now)
@@ -1401,8 +1543,10 @@ async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: i
         f"🏫 Sinf: <b>{esc(item['class'])}</b>\n"
         f"🕘 {lesson_num}-dars ({bell['start']} - {bell['end']})"
     )
-    if item["subject"] != cfg["subject"]:
+    if _subject_shown(teacher_key, item):
         text += f"\n📚 {esc(item['subject'])}"
+    if item.get("room"):
+        text += f"\n{_room_text(item)}"
     previous = next((l for l in lessons if l["lesson"] == lesson_num - 1), None)
     if previous and previous["class"] == item["class"]:
         text += "\n🔁 Oldingi dars bilan bir xil sinf"
