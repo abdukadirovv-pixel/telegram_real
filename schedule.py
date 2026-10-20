@@ -344,6 +344,113 @@ DEFAULT_TIMETABLE_10E = {
     ],
 }
 
+# --- 10-01 and 10-02 ---
+# The printouts already use the same bell times as the other classes (09:00 - 15:10, 7 lessons).
+# There are no rooms in these two timetables: room = "" (the bot then simply does not show a room).
+BELLS_1001 = [dict(b) for b in BELLS_10B]
+BELLS_1002 = [dict(b) for b in BELLS_10B]
+
+
+def _ls(subject: str, teachers: str = "-") -> dict:
+    """One lesson without a room."""
+    return {"subject": subject, "room": "", "teachers": teachers}
+
+
+_ENG_1 = "Raximberdiyeva H, Isaqova H"     # English teachers of 10-01
+_ENG_2 = "Raximberdiyeva H, Axmedova Z"    # English teachers of 10-02
+
+DEFAULT_TIMETABLE_1001 = {
+    0: [  # Dushanba
+        _ls("Kelajak soati", "Avazov S"),
+        _ls("O'zbekiston tarixi", "Matnazarova D"),
+        _ls("Fizika", "Satimov Dilshod, Yusupov F"),
+        _ls("Rus tili", "Jumaniyazova Y"),
+        _ls("Informatika va AT", "Avazov S"),
+        _ls("Dasturlash", "Yusupov Yunus"),
+        _ls("Akademik va KM", "Axmedova Z"),
+    ],
+    1: [  # Seshanba
+        _ls("Matematika I II", "Zaripov Sh"),
+        _ls("Ona tili", "Masharipova M"),
+        _ls("Ingliz tili", _ENG_1),
+        _ls("CHQBT"),
+        _ls("O'zbekiston tarixi", "Matnazarova D"),
+        _ls("Tarbiya", "Ro'zmetova D"),
+    ],
+    2: [  # Chorshanba
+        _ls("Algebra", "Olimov O, Sultonmurotova O"),
+        _ls("Ingliz tili", _ENG_1),
+        _ls("Matematika I II", "Zaripov Sh"),
+        _ls("Adabiyot", "Masharipova M"),
+        _ls("Geometriya", "Olimov O, Sultonmurotova O"),
+        _ls("Chiziqli algebra", "Yuldashev Y"),
+    ],
+    3: [  # Payshanba
+        _ls("Informatika va AT (T-f)", "G'oyibnazarov R"),
+        _ls("Matematika I II", "Zaripov Sh"),
+        _ls("Algebra", "Olimov O, Sultonmurotova O"),
+        _ls("Ona tili", "Masharipova M"),
+        _ls("Dasturlash", "Yusupov Yunus"),
+        _ls("CHQBT"),
+        _ls("Jaxon tarixi", "Matnazarova D"),
+    ],
+    4: [  # Juma
+        _ls("Adabiyot", "Masharipova M"),
+        _ls("Rus tili", "Jumaniyazova Y"),
+        _ls("Dasturlash", "Yusupov Yunus"),
+        _ls("Akademik va KM", "Axmedova Z"),
+        _ls("Informatika va AT (T-f)", "G'oyibnazarov R"),
+        _ls("Ingliz tili", _ENG_1),
+        _ls("Jismoniy tarbiya", "Husainov R"),
+    ],
+}
+
+DEFAULT_TIMETABLE_1002 = {
+    0: [  # Dushanba
+        _ls("Kelajak soati", "Satliqov G'"),
+        _ls("Ingliz tili", _ENG_2),
+        _ls("Informatika va AT", "Avazov S"),
+        _ls("Adabiyot", "Ko'palova Sh"),
+        _ls("O'zbekiston tarixi", "Matnazarova D"),
+        _ls("Akademik va KM", "Axmedova Z"),
+        _ls("Dasturlash", "Yusupov Yunus"),
+    ],
+    1: [  # Seshanba
+        _ls("O'zbekiston tarixi", "Matnazarova D"),
+        _ls("Matematika I II", "Zaripov Sh"),
+        _ls("Algebra", "Satliqov G', Ibragimov S"),
+        _ls("Tarbiya", "Ro'zmetova D"),
+        _ls("CHQBT"),
+        _ls("Fizika", "Yusupov F, Satimov Dilshod"),
+    ],
+    2: [  # Chorshanba
+        _ls("Jaxon tarixi", "Matnazarova D"),
+        _ls("Matematika I II", "Zaripov Sh"),
+        _ls("Adabiyot", "Ko'palova Sh"),
+        _ls("Rus tili", "Jumaniyazova Y"),
+        _ls("Chiziqli algebra", "Yuldashev Y"),
+        _ls("Ona tili", "Ko'palova Sh"),
+    ],
+    3: [  # Payshanba
+        _ls("Matematika I II", "Zaripov Sh"),
+        _ls("Ingliz tili", _ENG_2),
+        _ls("Informatika va AT (T-f)", "G'oyibnazarov R"),
+        _ls("Dasturlash", "Yusupov Yunus"),
+        _ls("Algebra", "Satliqov G', Ibragimov S"),
+        _ls("Ona tili", "Ko'palova Sh"),
+        _ls("CHQBT"),
+    ],
+    4: [  # Juma
+        _ls("Dasturlash", "Yusupov Yunus"),
+        _ls("Geometriya", "Satliqov G', Ibragimov S"),
+        _ls("Akademik va KM", "Axmedova Z"),
+        _ls("Jismoniy tarbiya", "Husainov R"),
+        _ls("Ingliz tili", _ENG_2),
+        _ls("Rus tili", "Jumaniyazova Y"),
+        _ls("Informatika va AT (T-f)", "G'oyibnazarov R"),
+    ],
+}
+
 # "morning" = time of the morning alert
 CLASSES = {
     "10a": {
@@ -366,6 +473,20 @@ CLASSES = {
         "morning": "08:00",
         "bells": BELLS_10E,
         "default": DEFAULT_TIMETABLE_10E,
+    },
+    "1001": {                      # typed as 10-01 or 1001 (hyphens are ignored)
+        "name": "10-01",
+        "short": "10-01",
+        "morning": "08:00",
+        "bells": BELLS_1001,
+        "default": DEFAULT_TIMETABLE_1001,
+    },
+    "1002": {
+        "name": "10-02",
+        "short": "10-02",
+        "morning": "08:00",
+        "bells": BELLS_1002,
+        "default": DEFAULT_TIMETABLE_1002,
     },
 }
 
@@ -1097,7 +1218,8 @@ def format_week(class_id: str, start: date) -> str:
         notes = get_notes(class_id, d)
         for idx, item in enumerate(timetable.get(wd, [])[:len(bells)]):
             mark = " ⚠️" if (idx + 1) in notes else ""
-            text += f"{idx + 1}. {esc(item['subject'])} ({esc(item['room'])}){mark}\n"
+            room = f" ({esc(item['room'])})" if item.get("room") else ""
+            text += f"{idx + 1}. {esc(item['subject'])}{room}{mark}\n"
         text += "\n"
     return text
 
@@ -1143,7 +1265,9 @@ def _next_block(class_id: str, nxt, now: datetime) -> str:
     if d == now.date():
         mins = math.ceil((start - now).total_seconds() / 60)
         text += f" ({fmt_minutes(mins)}dan keyin)"
-    text += f"\n🚪 Xona: {esc(item['room'])}\n👨‍🏫 O'qituvchi: {esc(item['teachers'])}"
+    if item.get("room"):
+        text += f"\n🚪 Xona: {esc(item['room'])}"
+    text += f"\n👨‍🏫 O'qituvchi: {esc(item['teachers'])}"
     if note:
         text += f"\n⚠️ <b>{esc(note)}</b>"
     return text
@@ -1171,9 +1295,10 @@ def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
         idx, item, end = current
         bell = bells[idx]
         left = math.ceil((end - now).total_seconds() / 60)
+        room_line = f"🚪 Xona: {esc(item['room'])}\n" if item.get("room") else ""
         text = (
             f"📍 <b>Hozir:</b> {bell['lesson']}-dars — {esc(item['subject'])}\n"
-            f"🚪 Xona: {esc(item['room'])}\n"
+            f"{room_line}"
             f"👨‍🏫 O'qituvchi: {esc(item['teachers'])}\n"
             f"⏳ Tugashiga {fmt_minutes(left)} qoldi"
         )
@@ -1492,11 +1617,12 @@ async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
     if idx + 1 < len(lessons):
         next_lesson = lessons[idx + 1]
         next_bell = bells[idx + 1]
+        room_line = f"🚪 <b>Xona:</b> {esc(next_lesson['room'])}\n" if next_lesson.get("room") else ""
         msg = (
             f"🔔 <b>{bell['lesson']}-dars ({esc(current_lesson['subject'])}) tugadi!</b>\n\n"
             f"➡️ <b>Keyingi dars ({next_bell['lesson']}-dars):</b> {esc(next_lesson['subject'])}\n"
             f"⏰ <b>Boshlanishi:</b> {next_bell['start']}\n"
-            f"🚪 <b>Xona:</b> {esc(next_lesson['room'])}\n"
+            f"{room_line}"
             f"👨‍🏫 <b>O'qituvchi:</b> {esc(next_lesson['teachers'])}"
         )
         note = get_notes(class_id, today).get(next_bell["lesson"])
