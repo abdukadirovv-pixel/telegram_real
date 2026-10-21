@@ -12,10 +12,12 @@ command.py  imports this file and holds all commands / buttons.
 main.py     imports both and starts the bot.
 """
 import os
+import re
 import html
 import math
 import asyncio
 import logging
+import threading
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,14 +28,12 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 # ======================================================================
 #  CONFIGURATION
 # ======================================================================
-# Optional: load variables from a local .env file (pip install python-dotenv)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# The token is NEVER stored in the code. Set it as an environment variable (BOT_TOKEN).
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set. Add it as an environment variable (see host settings).")
@@ -41,31 +41,179 @@ if not BOT_TOKEN:
 OWNER_ID = int(os.getenv("OWNER_ID", 8780228920))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
-# Optional: file_id of the funny sticker shown when there are no lessons left today.
-# (Send any sticker to the bot as the owner and it replies with its file_id.)
 FUNNY_STICKER_ID = os.getenv("FUNNY_STICKER_ID", "").strip()
 
-# Database connection pool reference (initialized in main.py or init_db)
-db_pool = None
+# ======================================================================
+#  SUPABASE ASYNCPG POOL + SYNCHRONOUS BRIDGE FOR COMMAND.PY
+# ======================================================================
+_orig_create_pool = asyncpg.create_pool
 
-async def init_db_pool():
+
+def _clean_dsn(dsn: str) -> str:
+    dsn = dsn.strip()
+    for suffix in ("?statement_cache_size=0", "&statement_cache_size=0"):
+        dsn = dsn.replace(suffix, "")
+    return dsn
+
+
+async def _patched_create_pool(dsn=None, *args, **kwargs):
+    kwargs.setdefault("statement_cache_size", 0)
+    if isinstance(dsn, str):
+        dsn = _clean_dsn(dsn)
+    try:
+        return await _orig_create_pool(dsn, *args, **kwargs)
+    except Exception as first_err:
+        if isinstance(dsn, str) and "@db.lmgsxyyhybjuosaxzfco.supabase.co" in dsn:
+            logging.warning(f"Direct IPv6 host unreachable ({first_err}); switching to Supabase IPv4 pooler...")
+            pooler_dsn = (
+                dsn.replace("postgresql://postgres:", "postgresql://postgres.lmgsxyyhybjuosaxzfco:")
+                .replace("@db.lmgsxyyhybjuosaxzfco.supabase.co:5432", "@aws-0-ap-northeast-2.pooler.supabase.com:6543")
+            )
+            return await _orig_create_pool(pooler_dsn, *args, **kwargs)
+        raise
+
+
+# Ensure any asyncpg.create_pool call in main.py automatically disables prepared statement cache
+asyncpg.create_pool = _patched_create_pool
+
+db_pool: asyncpg.Pool | None = None
+
+# Dedicated background event loop so synchronous functions in command.py & schedule.py work seamlessly
+_bg_loop = asyncio.new_event_loop()
+_bg_thread = threading.Thread(target=_bg_loop.run_forever, daemon=True)
+_bg_thread.start()
+_bg_pool: asyncpg.Pool | None = None
+
+
+async def _ensure_bg_pool() -> asyncpg.Pool:
+    global _bg_pool
+    if _bg_pool is None:
+        dsn = _clean_dsn(os.getenv("DATABASE_URL", ""))
+        if not dsn:
+            raise RuntimeError("DATABASE_URL is not set.")
+        _bg_pool = await _patched_create_pool(dsn, min_size=1, max_size=5)
+    return _bg_pool
+
+
+def _run_db(coro):
+    return asyncio.run_coroutine_threadsafe(coro, _bg_loop).result()
+
+
+class _DualBool:
+    """Works both in synchronous `if is_banned(uid):` and asynchronous `if await is_banned(uid):`."""
+    def __init__(self, val: bool):
+        self.val = bool(val)
+
+    def __bool__(self) -> bool:
+        return self.val
+
+    def __await__(self):
+        async def _coro():
+            return self.val
+        return _coro().__await__()
+
+
+def _translate_sql(sql: str) -> str:
+    s = sql.strip()
+    s = re.sub(r"COLLATE\s+NOCASE", 'COLLATE "C"', s, flags=re.IGNORECASE)
+
+    if re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", s, flags=re.IGNORECASE):
+        s = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, flags=re.IGNORECASE)
+        s += " ON CONFLICT DO NOTHING"
+    elif re.match(r"^INSERT\s+OR\s+REPLACE\s+INTO", s, flags=re.IGNORECASE):
+        s = re.sub(r"^INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", s, flags=re.IGNORECASE)
+        low = s.lower()
+        if "into bot_settings" in low:
+            s += " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+        elif "into class_overrides" in low:
+            s += " ON CONFLICT (class_id, day_date, lesson) DO UPDATE SET kind = EXCLUDED.kind, note = EXCLUDED.note"
+        elif "into class_timetable" in low:
+            s += " ON CONFLICT (class_id, day, pos) DO UPDATE SET subject = EXCLUDED.subject, room = EXCLUDED.room, teachers = EXCLUDED.teachers"
+        elif "into teacher_timetable" in low:
+            s += " ON CONFLICT (teacher_key, day, lesson) DO UPDATE SET class_label = EXCLUDED.class_label, class_id = EXCLUDED.class_id, subject = EXCLUDED.subject, room = EXCLUDED.room"
+
+    idx = 0
+    out = []
+    for ch in s:
+        if ch == "?":
+            idx += 1
+            out.append(f"${idx}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+class _CursorAdapter:
+    def __init__(self):
+        self._rows: list[tuple] = []
+        self._idx: int = 0
+        self.rowcount: int = 0
+
+    def execute(self, sql: str, params: tuple | list = ()):
+        pg_sql = _translate_sql(sql)
+        args = list(params)
+
+        async def _do():
+            pool = await _ensure_bg_pool()
+            async with pool.acquire() as c:
+                upper = pg_sql.lstrip().upper()
+                if upper.startswith("SELECT") or upper.startswith("WITH"):
+                    records = await c.fetch(pg_sql, *args)
+                    return [tuple(r) for r in records], len(records)
+                status = await c.execute(pg_sql, *args)
+                count = 0
+                if status:
+                    parts = status.split()
+                    if parts and parts[-1].isdigit():
+                        count = int(parts[-1])
+                return [], count
+
+        self._rows, self.rowcount = _run_db(_do())
+        self._idx = 0
+        return self
+
+    def fetchone(self):
+        if self._idx < len(self._rows):
+            row = self._rows[self._idx]
+            self._idx += 1
+            return row
+        return None
+
+    def fetchall(self):
+        rest = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return rest
+
+
+class _ConnAdapter:
+    def cursor(self):
+        return cursor
+
+    def commit(self):
+        pass
+
+
+cursor = _CursorAdapter()
+conn = _ConnAdapter()
+
+
+async def init_db_pool() -> asyncpg.Pool:
     global db_pool
     if db_pool is not None:
         return db_pool
-    
-    database_url = os.getenv("DATABASE_URL")
+    database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
         raise SystemExit("DATABASE_URL is not set. Add it as an environment variable.")
-    
-    db_pool = await asyncpg.create_pool(database_url)
+    db_pool = await asyncpg.create_pool(database_url, statement_cache_size=0)
     return db_pool
+
 
 # ======================================================================
 #  DATABASE SETUP
 # ======================================================================
 async def setup_database(pool: asyncpg.Pool):
-    async with pool.acquire() as conn:
-        await conn.execute("""
+    async with pool.acquire() as c:
+        await c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
@@ -75,13 +223,7 @@ async def setup_database(pool: asyncpg.Pool):
         """)
 
         async def ensure_column(table: str, column: str, ddl: str):
-            """Adds a column to an existing table if it is missing (safe migration)."""
-            exists = await conn.fetchval(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = $1 and column_name = $2",
-                table, column
-            )
-            if not exists:
-                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            await c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}")
 
         await ensure_column("users", "is_active", "INTEGER DEFAULT 1")
         await ensure_column("users", "banned", "INTEGER DEFAULT 0")
@@ -89,12 +231,11 @@ async def setup_database(pool: asyncpg.Pool):
         await ensure_column("users", "lesson_alerts", "INTEGER DEFAULT 1")
         await ensure_column("users", "announcements", "INTEGER DEFAULT 1")
         await ensure_column("users", "class_id", "TEXT")
-        await ensure_column("users", "teacher_key", "TEXT")          # set only by the owner (/setteacher)
-        await ensure_column("users", "admin_class", "TEXT")          # class admin: admin of ONE class only
+        await ensure_column("users", "teacher_key", "TEXT")
+        await ensure_column("users", "admin_class", "TEXT")
         await ensure_column("users", "menu_shown", "INTEGER DEFAULT 0")
 
-        # Every class has its OWN timetable and its OWN overrides (nothing is shared or merged)
-        await conn.execute("""
+        await c.execute("""
             CREATE TABLE IF NOT EXISTS class_timetable (
                 class_id TEXT,
                 day INTEGER,
@@ -105,7 +246,7 @@ async def setup_database(pool: asyncpg.Pool):
                 PRIMARY KEY (class_id, day, pos)
             )
         """)
-        await conn.execute("""
+        await c.execute("""
             CREATE TABLE IF NOT EXISTS class_overrides (
                 class_id TEXT,
                 day_date TEXT,
@@ -115,14 +256,13 @@ async def setup_database(pool: asyncpg.Pool):
                 PRIMARY KEY (class_id, day_date, lesson)
             )
         """)
-        await conn.execute("""
+        await c.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
-        # Teacher timetables (one row = one lesson slot of one teacher; slots may have gaps)
-        await conn.execute("""
+        await c.execute("""
             CREATE TABLE IF NOT EXISTS teacher_timetable (
                 teacher_key TEXT,
                 day INTEGER,
@@ -134,7 +274,8 @@ async def setup_database(pool: asyncpg.Pool):
                 PRIMARY KEY (teacher_key, day, lesson)
             )
         """)
-        await ensure_column("teacher_timetable", "room", "TEXT")   # databases made by an older version get the column
+        await ensure_column("teacher_timetable", "room", "TEXT")
+
 
 # Notification settings users can toggle in /settings
 SETTING_LABELS = {
@@ -154,18 +295,15 @@ def esc(value) -> str:
 # ======================================================================
 #  SETTINGS (key / value)
 # ======================================================================
-async def get_setting(key: str, default: str = "") -> str:
-    async with db_pool.acquire() as conn:
-        val = await conn.fetchval("SELECT value FROM bot_settings WHERE key = $1", key)
-        return val if val is not None else default
+def get_setting(key: str, default: str = "") -> str:
+    cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
 
 
-async def set_setting(key: str, value: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-            key, value
-        )
+def set_setting(key: str, value: str):
+    cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
 
 
 # ======================================================================
@@ -189,15 +327,12 @@ DAY_CODE_MAP = {
     "6": 5, "sh": 5, "shanba": 5, "sat": 5, "saturday": 5,
 }
 
-# Classes (like 10-E) and teachers can have Saturday lessons, so they share the same day tables
 TEACHER_DAY_NAMES = DAY_NAMES
 TEACHER_DAY_CODE_MAP = DAY_CODE_MAP
 
 # ======================================================================
-#  CLASSES  (add a new class = add one block here, nothing else changes)
+#  CLASSES
 # ======================================================================
-
-# --- 10-B aniq (the original schedule, unchanged) ---
 BELLS_10B = [
     {"lesson": 1, "start": "09:00", "end": "09:45"},
     {"lesson": 2, "start": "09:50", "end": "10:35"},
@@ -496,6 +631,9 @@ CLASSES = {
     },
 }
 
+# ======================================================================
+#  TEACHERS
+# ======================================================================
 TEACHER_BELLS = [dict(b) for b in BELLS_10A]
 
 
@@ -657,91 +795,87 @@ TEACHERS = {
     },
 }
 
+# ======================================================================
+#  CLASS TIMETABLES: migration, seeding, loading
+# ======================================================================
 TIMETABLES: dict[str, dict[int, list[dict]]] = {}
 
 
-async def table_exists(name: str) -> bool:
-    async with db_pool.acquire() as conn:
-        res = await conn.fetchval("SELECT 1 FROM information_schema.tables WHERE table_name = $1", name)
-        return res is not None
+def table_exists(name: str) -> bool:
+    cursor.execute("SELECT 1 FROM information_schema.tables WHERE table_name = ?", (name,))
+    return cursor.fetchone() is not None
 
 
-async def migrate_to_multiclass():
-    if await get_setting("multiclass_migrated") == "1":
+def migrate_to_multiclass():
+    if get_setting("multiclass_migrated") == "1":
         return
-    async with db_pool.acquire() as conn:
-        if await table_exists("timetable"):
-            await conn.execute(
-                "INSERT INTO class_timetable (class_id, day, pos, subject, room, teachers) "
-                "SELECT '10b', day, pos, subject, room, teachers FROM timetable "
-                "ON CONFLICT (class_id, day, pos) DO NOTHING"
-            )
-        if await table_exists("overrides"):
-            await conn.execute(
-                "INSERT INTO class_overrides (class_id, day_date, lesson, kind, note) "
-                "SELECT '10b', day_date, lesson, kind, note FROM overrides "
-                "ON CONFLICT (class_id, day_date, lesson) DO NOTHING"
-            )
-        await conn.execute("UPDATE users SET class_id = '10b' WHERE class_id IS NULL")
-    await set_setting("multiclass_migrated", "1")
-
-
-async def seed_class_if_needed(class_id: str):
-    if await get_setting(f"seeded_{class_id}") == "1":
-        return
-    async with db_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM class_timetable WHERE class_id = $1", class_id)
-        if count == 0:
-            for day, lessons in CLASSES[class_id]["default"].items():
-                for pos, item in enumerate(lessons, start=1):
-                    await conn.execute(
-                        "INSERT INTO class_timetable (class_id, day, pos, subject, room, teachers) "
-                        "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (class_id, day, pos) DO NOTHING",
-                        class_id, day, pos, item["subject"], item["room"], item["teachers"],
-                    )
-    await set_setting(f"seeded_{class_id}", "1")
-
-
-async def load_timetable():
-    fresh: dict[str, dict[int, list[dict]]] = {cid: {} for cid in CLASSES}
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT class_id, day, pos, subject, room, teachers FROM class_timetable ORDER BY class_id, day, pos"
+    if table_exists("timetable"):
+        cursor.execute(
+            "INSERT OR IGNORE INTO class_timetable (class_id, day, pos, subject, room, teachers) "
+            "SELECT '10b', day, pos, subject, room, teachers FROM timetable"
         )
-    for row in rows:
-        class_id, day, _pos, subject, room, teachers = row["class_id"], row["day"], row["pos"], row["subject"], row["room"], row["teachers"]
+    if table_exists("overrides"):
+        cursor.execute(
+            "INSERT OR IGNORE INTO class_overrides (class_id, day_date, lesson, kind, note) "
+            "SELECT '10b', day_date, lesson, kind, note FROM overrides"
+        )
+    cursor.execute("UPDATE users SET class_id = '10b' WHERE class_id IS NULL")
+    conn.commit()
+    set_setting("multiclass_migrated", "1")
+
+
+def seed_class_if_needed(class_id: str):
+    if get_setting(f"seeded_{class_id}") == "1":
+        return
+    cursor.execute("SELECT COUNT(*) FROM class_timetable WHERE class_id = ?", (class_id,))
+    if cursor.fetchone()[0] == 0:
+        for day, lessons in CLASSES[class_id]["default"].items():
+            for pos, item in enumerate(lessons, start=1):
+                cursor.execute(
+                    "INSERT OR IGNORE INTO class_timetable (class_id, day, pos, subject, room, teachers) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (class_id, day, pos, item["subject"], item["room"], item["teachers"]),
+                )
+        conn.commit()
+    set_setting(f"seeded_{class_id}", "1")
+
+
+def load_timetable():
+    fresh: dict[str, dict[int, list[dict]]] = {cid: {} for cid in CLASSES}
+    cursor.execute(
+        "SELECT class_id, day, pos, subject, room, teachers FROM class_timetable ORDER BY class_id, day, pos"
+    )
+    for class_id, day, _pos, subject, room, teachers in cursor.fetchall():
         if class_id in fresh:
             fresh[class_id].setdefault(day, []).append({"subject": subject, "room": room, "teachers": teachers})
     TIMETABLES.clear()
     TIMETABLES.update(fresh)
 
 
-async def seed_teacher_if_needed(teacher_key: str):
-    if await get_setting(f"seeded_teacher_{teacher_key}") == "1":
+def seed_teacher_if_needed(teacher_key: str):
+    if get_setting(f"seeded_teacher_{teacher_key}") == "1":
         return
-    async with db_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM teacher_timetable WHERE teacher_key = $1", teacher_key)
-        if count == 0:
-            for day, lessons in TEACHERS[teacher_key]["default"].items():
-                for item in lessons:
-                    await conn.execute(
-                        "INSERT INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject, room) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (teacher_key, day, lesson) DO NOTHING",
-                        teacher_key, day, item["lesson"], item["class"], item["class_id"], item["subject"],
-                        item.get("room"),
-                    )
-    await set_setting(f"seeded_teacher_{teacher_key}", "1")
+    cursor.execute("SELECT COUNT(*) FROM teacher_timetable WHERE teacher_key = ?", (teacher_key,))
+    if cursor.fetchone()[0] == 0:
+        for day, lessons in TEACHERS[teacher_key]["default"].items():
+            for item in lessons:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject, room) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (teacher_key, day, item["lesson"], item["class"], item["class_id"], item["subject"],
+                     item.get("room")),
+                )
+        conn.commit()
+    set_setting(f"seeded_teacher_{teacher_key}", "1")
 
 
-async def load_teacher_timetables():
+def load_teacher_timetables():
     fresh: dict[str, dict[int, list[dict]]] = {key: {} for key in TEACHERS}
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT teacher_key, day, lesson, class_label, class_id, subject, room FROM teacher_timetable "
-            "ORDER BY teacher_key, day, lesson"
-        )
-    for row in rows:
-        key, day, lesson, class_label, class_id, subject, room = row["teacher_key"], row["day"], row["lesson"], row["class_label"], row["class_id"], row["subject"], row["room"]
+    cursor.execute(
+        "SELECT teacher_key, day, lesson, class_label, class_id, subject, room FROM teacher_timetable "
+        "ORDER BY teacher_key, day, lesson"
+    )
+    for key, day, lesson, class_label, class_id, subject, room in cursor.fetchall():
         if key in fresh:
             fresh[key].setdefault(day, []).append(
                 {"lesson": lesson, "class": class_label, "class_id": class_id, "subject": subject, "room": room}
@@ -751,13 +885,13 @@ async def load_teacher_timetables():
 
 
 async def initialize_all_schedules():
-    await migrate_to_multiclass()
+    await asyncio.to_thread(migrate_to_multiclass)
     for _cid in CLASSES:
-        await seed_class_if_needed(_cid)
-    await load_timetable()
+        await asyncio.to_thread(seed_class_if_needed, _cid)
+    await asyncio.to_thread(load_timetable)
     for _tkey in TEACHERS:
-        await seed_teacher_if_needed(_tkey)
-    await load_teacher_timetables()
+        await asyncio.to_thread(seed_teacher_if_needed, _tkey)
+    await asyncio.to_thread(load_teacher_timetables)
 
 
 def class_bells(class_id: str) -> list[dict]:
@@ -802,83 +936,82 @@ def teacher_token(raw: str | None) -> str | None:
 # ======================================================================
 #  USERS
 # ======================================================================
-async def register_or_update_user(user_id: int, username: str, first_name: str):
+def register_or_update_user(user_id: int, username: str, first_name: str):
     user_id = int(user_id)
     role = "owner" if user_id == OWNER_ID else "user"
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, username, first_name, role)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                first_name=excluded.first_name,
-                is_active=1,
-                role=CASE WHEN users.user_id = $5 THEN 'owner' ELSE users.role END
-        """, user_id, username or "NoUsername", first_name or "User", role, OWNER_ID)
+    cursor.execute("""
+        INSERT INTO users (user_id, username, first_name, role)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=EXCLUDED.username,
+            first_name=EXCLUDED.first_name,
+            is_active=1,
+            role=CASE WHEN users.user_id = ? THEN 'owner' ELSE users.role END
+    """, (user_id, username or "NoUsername", first_name or "User", role, OWNER_ID))
+    conn.commit()
 
 
-async def get_user_role(user_id: int) -> str:
+def get_user_role(user_id: int) -> str:
     user_id = int(user_id)
     if user_id == OWNER_ID:
         return "owner"
-    async with db_pool.acquire() as conn:
-        role = await conn.fetchval("SELECT role FROM users WHERE user_id = $1", user_id)
-        return role if role else "user"
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    return row[0] if row else "user"
 
 
-async def is_admin_or_owner(user_id: int) -> bool:
-    return (await get_user_role(user_id)) in ["owner", "admin"]
+def is_admin_or_owner(user_id: int) -> bool:
+    return get_user_role(user_id) in ["owner", "admin"]
 
 
-async def get_all_users():
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key FROM users"
-        )
+def get_all_users():
+    cursor.execute(
+        "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key FROM users"
+    )
+    return cursor.fetchall()
 
 
-async def set_user_role(user_id: int, role: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET role = $1, admin_class = NULL WHERE user_id = $2", role, int(user_id))
+def set_user_role(user_id: int, role: str):
+    cursor.execute("UPDATE users SET role = ?, admin_class = NULL WHERE user_id = ?", (role, int(user_id)))
+    conn.commit()
 
 
-async def get_admin_class(user_id: int) -> str | None:
+def get_admin_class(user_id: int) -> str | None:
     if int(user_id) == OWNER_ID:
         return None
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT role, admin_class FROM users WHERE user_id = $1", int(user_id))
-        if row and row["role"] == "admin" and row["admin_class"] in CLASSES:
-            return row["admin_class"]
+    cursor.execute("SELECT role, admin_class FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    if row and row[0] == "admin" and row[1] in CLASSES:
+        return row[1]
     return None
 
 
-async def is_global_admin(user_id: int) -> bool:
-    return (await is_admin_or_owner(user_id)) and (await get_admin_class(user_id)) is None
+def is_global_admin(user_id: int) -> bool:
+    return is_admin_or_owner(user_id) and get_admin_class(user_id) is None
 
 
-async def set_class_admin(user_id: int, class_id: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET role = 'admin', admin_class = $1 WHERE user_id = $2", class_id, int(user_id)
-        )
-        await conn.execute(
-            "UPDATE users SET class_id = $1 WHERE user_id = $2 AND class_id IS NULL", class_id, int(user_id)
-        )
+def set_class_admin(user_id: int, class_id: str):
+    cursor.execute(
+        "UPDATE users SET role = 'admin', admin_class = ? WHERE user_id = ?", (class_id, int(user_id))
+    )
+    cursor.execute(
+        "UPDATE users SET class_id = ? WHERE user_id = ? AND class_id IS NULL", (class_id, int(user_id))
+    )
+    conn.commit()
 
 
-async def can_manage_user(admin_id: int, target_id: int) -> bool:
-    admin_class = await get_admin_class(admin_id)
+def can_manage_user(admin_id: int, target_id: int) -> bool:
+    admin_class = get_admin_class(admin_id)
     if admin_class is None:
-        return await is_admin_or_owner(admin_id)
-    if (await get_user_role(target_id)) in ("admin", "owner") or (await get_user_teacher(target_id)):
+        return is_admin_or_owner(admin_id)
+    if get_user_role(target_id) in ("admin", "owner") or get_user_teacher(target_id):
         return False
-    return (await get_user_class(target_id)) == admin_class
+    return get_user_class(target_id) == admin_class
 
 
-async def user_exists(user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        res = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", int(user_id))
-        return res is not None
+def user_exists(user_id: int) -> bool:
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (int(user_id),))
+    return cursor.fetchone() is not None
 
 
 def parse_id(raw) -> int | None:
@@ -888,94 +1021,93 @@ def parse_id(raw) -> int | None:
         return None
 
 
-async def is_banned(user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        banned = await conn.fetchval("SELECT banned FROM users WHERE user_id = $1", int(user_id))
-        return bool(banned)
+def is_banned(user_id: int) -> _DualBool:
+    cursor.execute("SELECT banned FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    return _DualBool(bool(row and row[0]))
 
 
-async def set_banned(user_id: int, value: bool):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET banned = $1 WHERE user_id = $2", 1 if value else 0, int(user_id))
+def set_banned(user_id: int, value: bool):
+    cursor.execute("UPDATE users SET banned = ? WHERE user_id = ?", (1 if value else 0, int(user_id)))
+    conn.commit()
 
 
-async def mark_inactive(user_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET is_active = 0 WHERE user_id = $1", int(user_id))
+def mark_inactive(user_id: int):
+    cursor.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (int(user_id),))
+    conn.commit()
 
 
-async def get_user_class(user_id: int) -> str | None:
-    async with db_pool.acquire() as conn:
-        class_id = await conn.fetchval("SELECT class_id FROM users WHERE user_id = $1", int(user_id))
-        return class_id if class_id in CLASSES else None
+def get_user_class(user_id: int) -> str | None:
+    cursor.execute("SELECT class_id FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    class_id = row[0] if row else None
+    return class_id if class_id in CLASSES else None
 
 
-async def set_user_class(user_id: int, class_id: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET class_id = $1 WHERE user_id = $2", class_id, int(user_id))
+def set_user_class(user_id: int, class_id: str):
+    cursor.execute("UPDATE users SET class_id = ? WHERE user_id = ?", (class_id, int(user_id)))
+    conn.commit()
 
 
-async def get_user_teacher(user_id: int) -> str | None:
-    async with db_pool.acquire() as conn:
-        key = await conn.fetchval("SELECT teacher_key FROM users WHERE user_id = $1", int(user_id))
-        return key if key in TEACHERS else None
+def get_user_teacher(user_id: int) -> str | None:
+    cursor.execute("SELECT teacher_key FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    key = row[0] if row else None
+    return key if key in TEACHERS else None
 
 
-async def set_user_teacher(user_id: int, teacher_key: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET teacher_key = $1, class_id = NULL, menu_shown = 0 WHERE user_id = $2",
-            teacher_key, int(user_id),
-        )
+def set_user_teacher(user_id: int, teacher_key: str):
+    cursor.execute(
+        "UPDATE users SET teacher_key = ?, class_id = NULL, menu_shown = 0 WHERE user_id = ?",
+        (teacher_key, int(user_id)),
+    )
+    conn.commit()
 
 
-async def clear_user_teacher(user_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET teacher_key = NULL, menu_shown = 0 WHERE user_id = $1", int(user_id))
+def clear_user_teacher(user_id: int):
+    cursor.execute("UPDATE users SET teacher_key = NULL, menu_shown = 0 WHERE user_id = ?", (int(user_id),))
+    conn.commit()
 
 
-async def get_teacher_users():
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT user_id, username, first_name, teacher_key FROM users WHERE teacher_key IS NOT NULL"
-        )
+def get_teacher_users():
+    cursor.execute(
+        "SELECT user_id, username, first_name, teacher_key FROM users WHERE teacher_key IS NOT NULL"
+    )
+    return cursor.fetchall()
 
 
-async def menu_shown(user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        val = await conn.fetchval("SELECT menu_shown FROM users WHERE user_id = $1", int(user_id))
-        return bool(val)
+def menu_shown(user_id: int) -> bool:
+    cursor.execute("SELECT menu_shown FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    return bool(row and row[0])
 
 
-async def mark_menu_shown(user_id: int, value: bool = True):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET menu_shown = $1 WHERE user_id = $2", 1 if value else 0, int(user_id))
+def mark_menu_shown(user_id: int, value: bool = True):
+    cursor.execute("UPDATE users SET menu_shown = ? WHERE user_id = ?", (1 if value else 0, int(user_id)))
+    conn.commit()
 
 
-async def get_recipients(flag: str | None = None, class_id: str | None = None) -> list[int]:
+def get_recipients(flag: str | None = None, class_id: str | None = None) -> list[int]:
     query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
     params: list = []
     if flag in SETTING_LABELS:
         query += f" AND {flag} = 1"
     if class_id:
+        query += " AND class_id = ?"
         params.append(class_id)
-        query += f" AND class_id = ${len(params)}"
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-        return [row["user_id"] for row in rows]
+    cursor.execute(query, params)
+    return [row[0] for row in cursor.fetchall()]
 
 
-async def get_teacher_recipients(teacher_key: str, flag: str | None = None) -> list[int]:
-    query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0 AND teacher_key = $1"
-    params = [teacher_key]
+def get_teacher_recipients(teacher_key: str, flag: str | None = None) -> list[int]:
+    query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0 AND teacher_key = ?"
     if flag in SETTING_LABELS:
         query += f" AND {flag} = 1"
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-        return [row["user_id"] for row in rows]
+    cursor.execute(query, (teacher_key,))
+    return [row[0] for row in cursor.fetchall()]
 
 
-async def get_audience_recipients(audience: str, flag: str | None = "announcements") -> list[int]:
+def get_audience_recipients(audience: str, flag: str | None = "announcements") -> list[int]:
     query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
     params: list = []
     if audience == "students":
@@ -983,15 +1115,14 @@ async def get_audience_recipients(audience: str, flag: str | None = "announcemen
     elif audience == "teachers":
         query += " AND teacher_key IS NOT NULL"
     elif audience in CLASSES:
+        query += " AND teacher_key IS NULL AND class_id = ?"
         params.append(audience)
-        query += f" AND teacher_key IS NULL AND class_id = ${len(params)}"
     elif audience != "all":
         return []
     if flag in SETTING_LABELS:
         query += f" AND {flag} = 1"
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-        return [row["user_id"] for row in rows]
+    cursor.execute(query, params)
+    return [row[0] for row in cursor.fetchall()]
 
 
 def users_scope_where(scope: str, include_teachers: bool):
@@ -1002,51 +1133,49 @@ def users_scope_where(scope: str, include_teachers: bool):
     if scope == "all":
         return ("1 = 1" if include_teachers else "teacher_key IS NULL"), []
     if scope in CLASSES:
-        return "class_id = $1 AND teacher_key IS NULL", [scope]
+        return "class_id = ? AND teacher_key IS NULL", [scope]
     return None
 
 
-async def get_users_in_scope(scope: str, include_teachers: bool):
+def get_users_in_scope(scope: str, include_teachers: bool):
     spec = users_scope_where(scope, include_teachers)
     if spec is None:
         return []
     where, params = spec
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key, admin_class "
-            f"FROM users WHERE {where} ORDER BY first_name COLLATE " + '"C"',
-            *params,
-        )
+    cursor.execute(
+        "SELECT user_id, username, first_name, role, is_active, banned, class_id, teacher_key, admin_class "
+        f"FROM users WHERE {where} ORDER BY first_name COLLATE NOCASE",
+        params,
+    )
+    return cursor.fetchall()
 
 
-async def count_users_in_scope(scope: str, include_teachers: bool) -> int:
+def count_users_in_scope(scope: str, include_teachers: bool) -> int:
     spec = users_scope_where(scope, include_teachers)
     if spec is None:
         return 0
     where, params = spec
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval(f"SELECT COUNT(*) FROM users WHERE {where}", *params)
+    cursor.execute(f"SELECT COUNT(*) FROM users WHERE {where}", params)
+    return cursor.fetchone()[0]
 
 
-async def get_settings(user_id: int) -> dict:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT morning_alert, lesson_alerts, announcements FROM users WHERE user_id = $1",
-            int(user_id),
-        )
-    if not row:
-        row = {"morning_alert": 1, "lesson_alerts": 1, "announcements": 1}
-    return dict(zip(SETTING_LABELS.keys(), [row["morning_alert"], row["lesson_alerts"], row["announcements"]]))
+def get_settings(user_id: int) -> dict:
+    cursor.execute(
+        "SELECT morning_alert, lesson_alerts, announcements FROM users WHERE user_id = ?",
+        (int(user_id),),
+    )
+    row = cursor.fetchone() or (1, 1, 1)
+    return dict(zip(SETTING_LABELS.keys(), row))
 
 
-async def subscribe_if_stopped(user_id: int):
-    settings = await get_settings(user_id)
+def subscribe_if_stopped(user_id: int):
+    settings = get_settings(user_id)
     if not any(settings.values()):
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET morning_alert = 1, lesson_alerts = 1, announcements = 1 WHERE user_id = $1",
-                int(user_id),
-            )
+        cursor.execute(
+            "UPDATE users SET morning_alert = 1, lesson_alerts = 1, announcements = 1 WHERE user_id = ?",
+            (int(user_id),),
+        )
+        conn.commit()
 
 
 # ======================================================================
@@ -1085,28 +1214,25 @@ def class_week_start(class_id: str, today: date) -> date:
     return today - timedelta(days=wd)
 
 
-async def get_off_reason(class_id: str, d: date) -> str | None:
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT note FROM class_overrides WHERE class_id = $1 AND day_date = $2 AND lesson = 0 AND kind = 'off'",
-            class_id, d.isoformat(),
-        )
+def get_off_reason(class_id: str, d: date) -> str | None:
+    cursor.execute(
+        "SELECT note FROM class_overrides WHERE class_id = ? AND day_date = ? AND lesson = 0 AND kind = 'off'",
+        (class_id, d.isoformat()),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 
-async def get_notes(class_id: str, d: date) -> dict[int, str]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT lesson, note FROM class_overrides WHERE class_id = $1 AND day_date = $2 AND kind = 'note'",
-            class_id, d.isoformat(),
-        )
-    return {row["lesson"]: row["note"] for row in rows}
+def get_notes(class_id: str, d: date) -> dict[int, str]:
+    cursor.execute(
+        "SELECT lesson, note FROM class_overrides WHERE class_id = ? AND day_date = ? AND kind = 'note'",
+        (class_id, d.isoformat()),
+    )
+    return {lesson: note for lesson, note in cursor.fetchall()}
 
 
-async def school_off(d: date) -> bool:
-    for cid in CLASSES:
-        if await get_off_reason(cid, d) is None:
-            return False
-    return True
+def school_off(d: date) -> bool:
+    return all(get_off_reason(cid, d) is not None for cid in CLASSES)
 
 
 def lesson_dt(d: date, hm: str) -> datetime:
@@ -1133,15 +1259,15 @@ def day_label(d: date, today: date) -> str:
 # ======================================================================
 #  CLASS SCHEDULE: lessons, texts
 # ======================================================================
-async def effective_lessons(class_id: str, d: date) -> list[dict]:
+def effective_lessons(class_id: str, d: date) -> list[dict]:
     timetable = class_timetable(class_id)
     wd = d.weekday()
-    if wd not in timetable or await get_off_reason(class_id, d) is not None:
+    if wd not in timetable or get_off_reason(class_id, d) is not None:
         return []
     return timetable[wd][:len(class_bells(class_id))]
 
 
-async def format_date_schedule(class_id: str, d: date) -> str:
+def format_date_schedule(class_id: str, d: date) -> str:
     timetable = class_timetable(class_id)
     bells = class_bells(class_id)
     wd = d.weekday()
@@ -1152,7 +1278,7 @@ async def format_date_schedule(class_id: str, d: date) -> str:
         return f"🎉 <b>Dam olish kuni! Darslar yo'q.</b> ({label})"
 
     day_title = DAY_NAMES.get(wd, "Dars Jadvali")
-    off = await get_off_reason(class_id, d)
+    off = get_off_reason(class_id, d)
     if off is not None:
         text = f"🎉 <b>{esc(day_title)} ({label}) — dars yo'q.</b> · {cname}"
         if off:
@@ -1160,7 +1286,7 @@ async def format_date_schedule(class_id: str, d: date) -> str:
         return text
 
     lessons = timetable[wd][:len(bells)]
-    notes = await get_notes(class_id, d)
+    notes = get_notes(class_id, d)
     text = f"📅 <b>Dars Jadvali: {esc(day_title)}</b> ({label}) · {cname}\n\n"
 
     for idx, item in enumerate(lessons):
@@ -1175,19 +1301,19 @@ async def format_date_schedule(class_id: str, d: date) -> str:
     return text
 
 
-async def format_week(class_id: str, start: date) -> str:
+def format_week(class_id: str, start: date) -> str:
     timetable = class_timetable(class_id)
     bells = class_bells(class_id)
     text = f"🗓 <b>Haftalik jadval</b> · {esc(class_name(class_id))}\n\n"
     for wd in range(6 if 5 in timetable else 5):
         d = start + timedelta(days=wd)
         text += f"<b>{esc(DAY_NAMES[wd])}</b> ({d.strftime('%d.%m')})"
-        off = await get_off_reason(class_id, d)
+        off = get_off_reason(class_id, d)
         if off is not None:
             text += " — 🎉 dars yo'q\n\n"
             continue
         text += "\n"
-        notes = await get_notes(class_id, d)
+        notes = get_notes(class_id, d)
         for idx, item in enumerate(timetable.get(wd, [])[:len(bells)]):
             mark = " ⚠️" if (idx + 1) in notes else ""
             room = f" ({esc(item['room'])})" if item.get("room") else ""
@@ -1200,9 +1326,9 @@ NO_LESSONS_LEFT_TEXT = "🏁 <b>Bugun uchun darslar qolmadi.</b>"
 JOKE_TEXT = "Shu malli ham adam o'qimi eee 😄"
 
 
-async def find_current(class_id: str, now: datetime):
+def find_current(class_id: str, now: datetime):
     bells = class_bells(class_id)
-    lessons = await effective_lessons(class_id, now.date())
+    lessons = effective_lessons(class_id, now.date())
     for idx, item in enumerate(lessons):
         bell = bells[idx]
         start = lesson_dt(now.date(), bell["start"])
@@ -1212,21 +1338,21 @@ async def find_current(class_id: str, now: datetime):
     return None
 
 
-async def find_next(class_id: str, now: datetime, days: int = 8):
+def find_next(class_id: str, now: datetime, days: int = 8):
     bells = class_bells(class_id)
     for offset in range(0, days):
         d = now.date() + timedelta(days=offset)
-        for idx, item in enumerate(await effective_lessons(class_id, d)):
+        for idx, item in enumerate(effective_lessons(class_id, d)):
             start = lesson_dt(d, bells[idx]["start"])
             if start > now:
                 return d, idx, item, start
     return None
 
 
-async def _next_block(class_id: str, nxt, now: datetime) -> str:
+def _next_block(class_id: str, nxt, now: datetime) -> str:
     d, idx, item, start = nxt
     bell = class_bells(class_id)[idx]
-    note = (await get_notes(class_id, d)).get(bell["lesson"])
+    note = get_notes(class_id, d).get(bell["lesson"])
 
     text = (
         f"➡️ <b>Keyingi dars:</b> {bell['lesson']}-dars — {esc(item['subject'])}\n"
@@ -1243,21 +1369,21 @@ async def _next_block(class_id: str, nxt, now: datetime) -> str:
     return text
 
 
-async def next_lesson_text(class_id: str, now: datetime) -> str:
-    nxt = await find_next(class_id, now)
+def next_lesson_text(class_id: str, now: datetime) -> str:
+    nxt = find_next(class_id, now)
     if not nxt:
         return "ℹ️ Yaqin kunlarda dars topilmadi."
-    return await _next_block(class_id, nxt, now)
+    return _next_block(class_id, nxt, now)
 
 
-async def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
+def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
     bells = class_bells(class_id)
-    lessons = await effective_lessons(class_id, now.date())
+    lessons = effective_lessons(class_id, now.date())
     if not lessons:
         return "🎉 <b>Bugun dars yo'q.</b>\nKeyingi dars: /next", False
 
-    current = await find_current(class_id, now)
-    upcoming = await find_next(class_id, now, days=1)
+    current = find_current(class_id, now)
+    upcoming = find_next(class_id, now, days=1)
 
     if current:
         idx, item, end = current
@@ -1271,7 +1397,7 @@ async def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
             f"⏳ Tugashiga {fmt_minutes(left)} qoldi"
         )
         if upcoming:
-            text += "\n\n" + (await _next_block(class_id, upcoming, now))
+            text += "\n\n" + _next_block(class_id, upcoming, now)
         else:
             text += "\n\n🎉 Bu bugungi oxirgi dars!"
         return text, False
@@ -1279,18 +1405,18 @@ async def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
     if upcoming:
         first_start = lesson_dt(now.date(), bells[0]["start"])
         head = "⏰ <b>Darslar hali boshlanmagan.</b>" if now < first_start else "☕ <b>Hozir tanaffus.</b>"
-        return head + "\n\n" + (await _next_block(class_id, upcoming, now)), False
+        return head + "\n\n" + _next_block(class_id, upcoming, now), False
 
     return NO_LESSONS_LEFT_TEXT + "\n\n" + JOKE_TEXT, True
 
 
-async def class_time_left_text(class_id: str, now: datetime) -> str:
+def class_time_left_text(class_id: str, now: datetime) -> str:
     bells = class_bells(class_id)
-    lessons = await effective_lessons(class_id, now.date())
+    lessons = effective_lessons(class_id, now.date())
     if not lessons:
         return "🎉 <b>Bugun dars yo'q.</b>"
 
-    current = await find_current(class_id, now)
+    current = find_current(class_id, now)
     if current:
         idx, item, end = current
         bell = bells[idx]
@@ -1300,7 +1426,7 @@ async def class_time_left_text(class_id: str, now: datetime) -> str:
             f"<b>{fmt_minutes(left)}</b> qoldi (tugash vaqti: {bell['end']})."
         )
 
-    upcoming = await find_next(class_id, now, days=1)
+    upcoming = find_next(class_id, now, days=1)
     if upcoming:
         d, idx, item, start = upcoming
         bell = bells[idx]
@@ -1320,14 +1446,14 @@ def teacher_bell(lesson_num: int) -> dict:
     return TEACHER_BELLS[lesson_num - 1]
 
 
-async def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
+def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
     lessons = TEACHERS[teacher_key]["timetable"].get(d.weekday(), [])
-    if not lessons or (await school_off(d)):
+    if not lessons or school_off(d):
         return []
     result = []
     for item in lessons:
         class_id = item.get("class_id")
-        if class_id and await get_off_reason(class_id, d) is not None:
+        if class_id and get_off_reason(class_id, d) is not None:
             continue
         result.append(item)
     return result
@@ -1342,7 +1468,7 @@ def _room_text(item: dict) -> str:
     return f"🚪 Xona: {esc(item['room'])}" if item.get("room") else ""
 
 
-async def _teacher_line(teacher_key: str, d: date, item: dict) -> str:
+def _teacher_line(teacher_key: str, d: date, item: dict) -> str:
     bell = teacher_bell(item["lesson"])
     line = f"<b>{item['lesson']}-dars ({bell['start']} - {bell['end']}):</b> {esc(item['class'])}"
     if _subject_shown(teacher_key, item):
@@ -1351,34 +1477,34 @@ async def _teacher_line(teacher_key: str, d: date, item: dict) -> str:
         line += f" | {_room_text(item)}"
     line += "\n"
     if item.get("class_id"):
-        note = (await get_notes(item["class_id"], d)).get(item["lesson"])
+        note = get_notes(item["class_id"], d).get(item["lesson"])
         if note:
             line += f"└ ⚠️ <b>{esc(note)}</b>\n"
     return line
 
 
-async def format_teacher_day(teacher_key: str, d: date) -> str:
+def format_teacher_day(teacher_key: str, d: date) -> str:
     label = d.strftime("%d.%m.%Y")
     day_title = TEACHER_DAY_NAMES.get(d.weekday())
     if day_title is None:
         return f"🎉 <b>Dam olish kuni!</b> ({label}) — darslar yo'q."
 
-    lessons = await teacher_lessons(teacher_key, d)
+    lessons = teacher_lessons(teacher_key, d)
     if not lessons:
         return f"🎉 <b>{esc(day_title)} ({label}):</b> sizda dars yo'q — bekorsiz!"
 
     text = f"📅 <b>Darslaringiz: {esc(day_title)}</b> ({label})\n\n"
     for item in lessons:
-        text += (await _teacher_line(teacher_key, d, item)) + "\n"
+        text += _teacher_line(teacher_key, d, item) + "\n"
     return text
 
 
-async def format_teacher_week(teacher_key: str, start: date) -> str:
+def format_teacher_week(teacher_key: str, start: date) -> str:
     text = "🗓 <b>Haftalik darslaringiz</b>\n\n"
     for wd in range(6):
         d = start + timedelta(days=wd)
         text += f"<b>{esc(TEACHER_DAY_NAMES[wd])}</b> ({d.strftime('%d.%m')})\n"
-        lessons = await teacher_lessons(teacher_key, d)
+        lessons = teacher_lessons(teacher_key, d)
         if not lessons:
             text += "—\n\n"
             continue
@@ -1414,8 +1540,8 @@ def format_teacher_timetable(teacher_key: str) -> str:
     return text
 
 
-async def find_teacher_current(teacher_key: str, now: datetime):
-    for item in await teacher_lessons(teacher_key, now.date()):
+def find_teacher_current(teacher_key: str, now: datetime):
+    for item in teacher_lessons(teacher_key, now.date()):
         bell = teacher_bell(item["lesson"])
         start = lesson_dt(now.date(), bell["start"])
         end = lesson_dt(now.date(), bell["end"])
@@ -1424,17 +1550,17 @@ async def find_teacher_current(teacher_key: str, now: datetime):
     return None
 
 
-async def find_teacher_next(teacher_key: str, now: datetime, days: int = 8):
+def find_teacher_next(teacher_key: str, now: datetime, days: int = 8):
     for offset in range(0, days):
         d = now.date() + timedelta(days=offset)
-        for item in await teacher_lessons(teacher_key, d):
+        for item in teacher_lessons(teacher_key, d):
             start = lesson_dt(d, teacher_bell(item["lesson"])["start"])
             if start > now:
                 return d, item, start
     return None
 
 
-async def _teacher_next_block(teacher_key: str, nxt, now: datetime) -> str:
+def _teacher_next_block(teacher_key: str, nxt, now: datetime) -> str:
     d, item, start = nxt
     bell = teacher_bell(item["lesson"])
     text = (
@@ -1449,21 +1575,21 @@ async def _teacher_next_block(teacher_key: str, nxt, now: datetime) -> str:
     if item.get("room"):
         text += f"\n{_room_text(item)}"
     if item.get("class_id"):
-        note = (await get_notes(item["class_id"], d)).get(item["lesson"])
+        note = get_notes(item["class_id"], d).get(item["lesson"])
         if note:
             text += f"\n⚠️ <b>{esc(note)}</b>"
     return text
 
 
-async def teacher_next_text(teacher_key: str, now: datetime) -> str:
-    nxt = await find_teacher_next(teacher_key, now)
+def teacher_next_text(teacher_key: str, now: datetime) -> str:
+    nxt = find_teacher_next(teacher_key, now)
     if not nxt:
         return "ℹ️ Yaqin kunlarda darsingiz yo'q."
-    return await _teacher_next_block(teacher_key, nxt, now)
+    return _teacher_next_block(teacher_key, nxt, now)
 
 
-async def teacher_now_text(teacher_key: str, now: datetime) -> str:
-    current = await find_teacher_current(teacher_key, now)
+def teacher_now_text(teacher_key: str, now: datetime) -> str:
+    current = find_teacher_current(teacher_key, now)
     if current:
         item, end = current
         bell = teacher_bell(item["lesson"])
@@ -1479,17 +1605,17 @@ async def teacher_now_text(teacher_key: str, now: datetime) -> str:
         if item.get("room"):
             text += f"\n{_room_text(item)}"
         if item.get("class_id"):
-            note = (await get_notes(item["class_id"], now.date())).get(item["lesson"])
+            note = get_notes(item["class_id"], now.date()).get(item["lesson"])
             if note:
                 text += f"\n⚠️ <b>{esc(note)}</b>"
-        upcoming = await find_teacher_next(teacher_key, now, days=1)
+        upcoming = find_teacher_next(teacher_key, now, days=1)
         if upcoming:
-            text += "\n\n" + (await _teacher_next_block(teacher_key, upcoming, now))
+            text += "\n\n" + _teacher_next_block(teacher_key, upcoming, now)
         else:
             text += "\n\n🎉 Bu bugungi oxirgi darsingiz!"
         return text
 
-    return "😎 <b>Sizda hozir dars yo'q - bekorsiz</b>\n\n" + (await teacher_next_text(teacher_key, now))
+    return "😎 <b>Sizda hozir dars yo'q - bekorsiz</b>\n\n" + teacher_next_text(teacher_key, now)
 
 
 # ======================================================================
@@ -1504,13 +1630,13 @@ async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML",
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
         except TelegramForbiddenError:
-            await mark_inactive(user_id)
+            await asyncio.to_thread(mark_inactive, user_id)
             STATS["blocked"] += 1
             return "blocked"
         except TelegramBadRequest as e:
             message_text = str(e).lower()
             if "chat not found" in message_text or "deactivated" in message_text:
-                await mark_inactive(user_id)
+                await asyncio.to_thread(mark_inactive, user_id)
                 STATS["blocked"] += 1
                 return "blocked"
             logging.error(f"Bad request for user {user_id}: {e}")
@@ -1526,7 +1652,8 @@ async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML",
 
 async def broadcast_message(bot: Bot, text: str, flag: str | None = None, class_id: str | None = None) -> dict:
     result = {"ok": 0, "blocked": 0, "failed": 0}
-    for u_id in await get_recipients(flag, class_id):
+    recipients = await asyncio.to_thread(get_recipients, flag, class_id)
+    for u_id in recipients:
         status = await safe_send(bot, u_id, text)
         result[status] += 1
         await asyncio.sleep(0.05)
@@ -1535,7 +1662,8 @@ async def broadcast_message(bot: Bot, text: str, flag: str | None = None, class_
 
 async def broadcast_to(bot: Bot, text: str, audience: str, flag: str | None = "announcements") -> dict:
     result = {"ok": 0, "blocked": 0, "failed": 0}
-    for u_id in await get_audience_recipients(audience, flag):
+    recipients = await asyncio.to_thread(get_audience_recipients, audience, flag)
+    for u_id in recipients:
         status = await safe_send(bot, u_id, text)
         result[status] += 1
         await asyncio.sleep(0.05)
@@ -1550,20 +1678,19 @@ async def send_morning_alert(bot: Bot, class_id: str):
     if today.weekday() not in class_timetable(class_id):
         return
 
-    if await get_off_reason(class_id, today) is not None:
-        msg = "☀️ <b>Xayrli kun!</b>\n\n" + (await format_date_schedule(class_id, today))
+    off_reason = await asyncio.to_thread(get_off_reason, class_id, today)
+    sched_text = await asyncio.to_thread(format_date_schedule, class_id, today)
+    if off_reason is not None:
+        msg = "☀️ <b>Xayrli kun!</b>\n\n" + sched_text
     else:
-        msg = (
-            "☀️ <b>Xayrli kun! Darslar boshlanishiga 1 soat qoldi.</b>\n\n"
-            + (await format_date_schedule(class_id, today))
-        )
+        msg = "☀️ <b>Xayrli kun! Darslar boshlanishiga 1 soat qoldi.</b>\n\n" + sched_text
     await broadcast_message(bot, msg, flag="morning_alert", class_id=class_id)
 
 
 async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
     today = datetime.now(UZB_TZ).date()
     bells = class_bells(class_id)
-    lessons = await effective_lessons(class_id, today)
+    lessons = await asyncio.to_thread(effective_lessons, class_id, today)
     idx = lesson_num - 1
 
     if idx >= len(lessons):
@@ -1583,7 +1710,8 @@ async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
             f"{room_line}"
             f"👨‍🏫 <b>O'qituvchi:</b> {esc(next_lesson['teachers'])}"
         )
-        note = (await get_notes(class_id, today)).get(next_bell["lesson"])
+        notes = await asyncio.to_thread(get_notes, class_id, today)
+        note = notes.get(next_bell["lesson"])
         if note:
             msg += f"\n⚠️ <b>{esc(note)}</b>"
     else:
@@ -1600,18 +1728,22 @@ async def send_teacher_morning(bot: Bot, teacher_key: str):
     cfg = TEACHERS[teacher_key]
     if now.weekday() == 5 and not cfg["timetable"].get(5):
         return
-    text = f"☀️ <b>Xayrli tong, {esc(cfg['short'])} ustoz!</b>\n\n" + (await format_teacher_day(teacher_key, now.date()))
-    if not (await teacher_lessons(teacher_key, now.date())):
-        text += "\n\n" + (await teacher_next_text(teacher_key, now))
+    day_text = await asyncio.to_thread(format_teacher_day, teacher_key, now.date())
+    text = f"☀️ <b>Xayrli tong, {esc(cfg['short'])} ustoz!</b>\n\n" + day_text
+    t_lessons = await asyncio.to_thread(teacher_lessons, teacher_key, now.date())
+    if not t_lessons:
+        nxt_text = await asyncio.to_thread(teacher_next_text, teacher_key, now)
+        text += "\n\n" + nxt_text
 
-    for user_id in await get_teacher_recipients(teacher_key, "morning_alert"):
+    recipients = await asyncio.to_thread(get_teacher_recipients, teacher_key, "morning_alert")
+    for user_id in recipients:
         await safe_send(bot, user_id, text)
         await asyncio.sleep(0.05)
 
 
 async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: int):
     today = datetime.now(UZB_TZ).date()
-    lessons = await teacher_lessons(teacher_key, today)
+    lessons = await asyncio.to_thread(teacher_lessons, teacher_key, today)
     item = next((l for l in lessons if l["lesson"] == lesson_num), None)
     if item is None:
         return
@@ -1632,10 +1764,12 @@ async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: i
     if previous and previous["class"] == item["class"]:
         text += "\n🔁 Oldingi dars bilan bir xil sinf"
     if item.get("class_id"):
-        note = (await get_notes(item["class_id"], today)).get(lesson_num)
+        notes = await asyncio.to_thread(get_notes, item["class_id"], today)
+        note = notes.get(lesson_num)
         if note:
             text += f"\n⚠️ <b>{esc(note)}</b>"
 
-    for user_id in await get_teacher_recipients(teacher_key, "lesson_alerts"):
+    recipients = await asyncio.to_thread(get_teacher_recipients, teacher_key, "lesson_alerts")
+    for user_id in recipients:
         await safe_send(bot, user_id, text)
         await asyncio.sleep(0.05)
