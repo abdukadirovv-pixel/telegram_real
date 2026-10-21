@@ -17,6 +17,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, types
 from aiohttp import web  # already installed together with aiogram
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import schedule
 from schedule import (
     BOT_TOKEN,
     CLASSES,
@@ -123,7 +124,13 @@ async def main():
     if database_url:
         try:
             db_pool = await asyncpg.create_pool(database_url)
-            logging.info("Connected to Supabase PostgreSQL successfully!")
+            
+            # Link pool to schedule.py and initialize tables/data
+            schedule.db_pool = db_pool
+            await schedule.setup_database(db_pool)
+            await schedule.initialize_all_schedules()
+            
+            logging.info("Connected to Supabase PostgreSQL and initialized schedules successfully!")
         except Exception as e:
             logging.error(f"Failed to connect to the database: {e}")
     else:
