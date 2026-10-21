@@ -209,6 +209,7 @@ ADMIN_HELP = (
     "Sana: <code>YYYY-MM-DD</code>, <code>bugun</code> yoki <code>ertaga</code>"
 )
 
+
 def class_admin_help(class_id: str) -> str:
     """Help of a class admin: only what he is allowed to do (his own class)."""
     return (
