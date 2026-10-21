@@ -12,7 +12,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
-import asyncpg
 from aiogram import BaseMiddleware, Bot, Dispatcher, types
 from aiohttp import web  # already installed together with aiogram
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -122,32 +121,14 @@ async def main():
     runner = await start_health_server()
 
     # --- SUPABASE DATABASE POOL INITIALIZATION ---
-    database_url = os.getenv("DATABASE_URL", "").strip()
     db_pool = None
-    if database_url:
-        # Remove URL query param if present and ensure IPv4 Pooler host is used on Render
-        database_url = database_url.split("?")[0]
-        if "@db.lmgsxyyhybjuosaxzfco.supabase.co" in database_url:
-            database_url = database_url.replace(
-                "postgresql://postgres:", "postgresql://postgres.lmgsxyyhybjuosaxzfco:"
-            ).replace(
-                "@db.lmgsxyyhybjuosaxzfco.supabase.co:5432",
-                "@aws-0-ap-northeast-2.pooler.supabase.com:6543",
-            )
-        try:
-            # statement_cache_size=0 is required for Supabase PgBouncer transaction pooler
-            db_pool = await asyncpg.create_pool(database_url, statement_cache_size=0)
-
-            # Link pool to schedule.py and initialize tables/data
-            schedule.db_pool = db_pool
-            await schedule.setup_database(db_pool)
-            await schedule.initialize_all_schedules()
-
-            logging.info("Connected to Supabase PostgreSQL and initialized schedules successfully!")
-        except Exception as e:
-            logging.error(f"Failed to connect to the database: {e}")
-    else:
-        logging.warning("DATABASE_URL environment variable is not set!")
+    try:
+        db_pool = await schedule.init_db_pool()
+        await schedule.setup_database(db_pool)
+        await schedule.initialize_all_schedules()
+        logging.info("Connected to Supabase PostgreSQL and initialized schedules successfully!")
+    except Exception as e:
+        logging.error(f"Failed to connect to the database: {e}")
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
