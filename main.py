@@ -118,6 +118,9 @@ async def start_health_server():
 async def main():
     logging.basicConfig(level=logging.INFO)
 
+    # 1. Start the health server IMMEDIATELY so Render detects the port right away
+    runner = await start_health_server()
+
     # --- SUPABASE DATABASE POOL INITIALIZATION ---
     database_url = os.getenv("DATABASE_URL")
     db_pool = None
@@ -147,7 +150,6 @@ async def main():
     dp.callback_query.outer_middleware(BanMiddleware())
     dp.include_router(router)
 
-    runner = await start_health_server()
     scheduler = setup_scheduler(bot)
     scheduler.start()
     
