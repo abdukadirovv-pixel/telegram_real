@@ -136,7 +136,7 @@ def welcome_text(class_id: str) -> str:
         "• Hozirgi va keyingi dars: <code>/now</code>, <code>/next</code>\n"
         "• Sozlamalar: <code>/settings</code>\n"
         "• Barcha buyruqlar: <code>/help</code>\n\n"
-        "ℹ️ Botga yozgan xabarlaringizni bot egasi ko'rishi mumkin."
+        "ℹ️ Botga yozgan xabarlaringizni bot egasi va adminlar ko'rishi mumkin."
     )
 
 
@@ -192,6 +192,7 @@ ADMIN_HELP = (
     f"• <code>/users [{_CODES}|none|all]</code> — foydalanuvchilar (har sinf alohida oynada)\n"
     "• <code>/stats</code> — statistika\n"
     "• <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code>\n"
+    "• <code>/inbox on|off</code> — o'quvchilar botga yozgan xabarlar senga kelsinmi\n"
     "• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>\n"
     "• <code>/setclass &lt;user_id&gt; &lt;sinf&gt;</code> — foydalanuvchi sinfini o'zgartirish\n\n"
     "📢 <b>Xabar yuborish</b>\n"
@@ -209,7 +210,6 @@ ADMIN_HELP = (
     "Sana: <code>YYYY-MM-DD</code>, <code>bugun</code> yoki <code>ertaga</code>"
 )
 
-
 def class_admin_help(class_id: str) -> str:
     """Help of a class admin: only what he is allowed to do (his own class)."""
     return (
@@ -218,6 +218,7 @@ def class_admin_help(class_id: str) -> str:
         "• <code>/users</code> — sinfingiz o'quvchilari\n"
         f"• <code>/broadcast_{class_id} &lt;xabar&gt;</code> — sinfingizga e'lon\n"
         "• <code>/dm &lt;user_id&gt; &lt;xabar&gt;</code> — o'quvchiga xabar\n"
+        "• <code>/inbox on|off</code> — sinfingiz o'quvchilari botga yozgan xabarlar senga kelsinmi\n"
         "• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>\n"
         f"• <code>/setclass &lt;user_id&gt; {class_id}</code> — sinfsiz o'quvchini sinfingizga qo'shish "
         "(<code>none</code> — sinfdan chiqarish)\n\n"
@@ -238,7 +239,6 @@ OWNER_HELP = (
     "• <code>/removeadmin &lt;user_id&gt;</code>\n"
     "• <code>/makeclassadmin &lt;user_id&gt; &lt;sinf&gt;</code> — faqat bitta sinf admini\n"
     "• <code>/admins</code> — adminlar ro'yxati\n"
-    "• <code>/inbox on|off</code> — foydalanuvchi xabarlarini senga yuborish\n"
     "• <code>/users teachers</code> — o'qituvchilar oynasi\n"
     "• <code>/broadcast_teachers &lt;xabar&gt;</code> — faqat o'qituvchilarga\n"
     "• <code>/setteacher &lt;ism&gt; &lt;user_id&gt;</code> — o'qituvchi rejimini yoqish\n"
@@ -1678,17 +1678,28 @@ async def cmd_teacher_week(message: types.Message, command: CommandObject):
 # ======================================================================
 @router.message(Command("inbox"))
 async def cmd_inbox(message: types.Message, command: CommandObject):
-    if not await require_owner(message, "❌ Faqat Owner foydalana oladi."):
+    """/inbox on|off  -  every admin decides if he gets the messages that people write to the bot.
+    Owner: everybody's messages. Main admin: all students. Class admin: only his own class."""
+    if not await require_admin(message):
         return
 
+    uid = message.from_user.id
     arg = (command.args or "").strip().lower()
     if arg in ("on", "off"):
-        set_setting("inbox", arg)
+        set_inbox(uid, arg == "on")
 
-    enabled = get_setting("inbox", "on") == "on"
-    status = "yoqilgan ✅" if enabled else "o'chirilgan ❌"
+    own_class = get_admin_class(uid)
+    if own_class:
+        scope = f"faqat <b>{esc(class_name(own_class))}</b> o'quvchilari"
+    elif uid == OWNER_ID:
+        scope = "barcha foydalanuvchilar (o'qituvchilar ham)"
+    else:
+        scope = "barcha o'quvchilar"
+
+    status = "yoqilgan ✅" if is_inbox_on(uid) else "o'chirilgan ❌"
     await message.answer(
         f"📥 Inbox: <b>{status}</b>\n"
+        f"Qaysi xabarlar: {scope}\n\n"
         "Ishlatish: <code>/inbox on</code> yoki <code>/inbox off</code>",
         parse_mode="HTML"
     )
@@ -1698,6 +1709,8 @@ async def cmd_inbox(message: types.Message, command: CommandObject):
 # (commands, menu buttons) has already taken.
 @router.message()
 async def forward_to_owner(message: types.Message, bot: Bot):
+    """Forwards what people write to the bot to the admins who have /inbox on
+    (see get_inbox_recipients for who gets what)."""
     user = message.from_user
     if user is None or message.chat.type != "private":
         return
@@ -1715,7 +1728,8 @@ async def forward_to_owner(message: types.Message, bot: Bot):
             )
         return
 
-    if get_setting("inbox", "on") != "on":
+    recipients = get_inbox_recipients(user.id)
+    if not recipients:
         return
 
     uname = f"@{esc(user.username)}" if user.username else "NoUsername"
@@ -1730,9 +1744,10 @@ async def forward_to_owner(message: types.Message, bot: Bot):
         f"📨 <b>{esc(user.first_name or 'NoName')}</b> ({uname}) | {tag} | ID: <code>{user.id}</code>\n"
         f"Javob: <code>/dm {user.id} </code>"
     )
-    try:
-        await bot.send_message(OWNER_ID, header, parse_mode="HTML")
-        # copy_message works for any type: text, photo, sticker, voice, file...
-        await bot.copy_message(OWNER_ID, message.chat.id, message.message_id)
-    except Exception as e:
-        logging.error(f"Could not forward message from {user.id} to owner: {e}")
+    for recipient_id in recipients:
+        try:
+            await bot.send_message(recipient_id, header, parse_mode="HTML")
+            # copy_message works for any type: text, photo, sticker, voice, file...
+            await bot.copy_message(recipient_id, message.chat.id, message.message_id)
+        except Exception as e:
+            logging.error(f"Could not forward message from {user.id} to {recipient_id}: {e}")
