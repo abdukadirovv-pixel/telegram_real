@@ -37,7 +37,7 @@ from command import router
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if user and user.id != OWNER_ID and await is_banned(user.id):
+        if user and user.id != OWNER_ID and is_banned(user.id):
             if isinstance(event, types.CallbackQuery):
                 await event.answer("⛔", show_alert=True)
             return None
