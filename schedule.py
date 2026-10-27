@@ -12,28 +12,28 @@ command.py  imports this file and holds all commands / buttons.
 main.py     imports both and starts the bot.
 """
 import os
-import re
 import html
 import math
 import asyncio
 import logging
-import threading
+import sqlite3
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 
-import asyncpg
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
 # ======================================================================
 #  CONFIGURATION
 # ======================================================================
+# Optional: load variables from a local .env file (pip install python-dotenv)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
+# The token is NEVER stored in the code. Set it as an environment variable (BOT_TOKEN).
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set. Add it as an environment variable (see host settings).")
@@ -41,241 +41,92 @@ if not BOT_TOKEN:
 OWNER_ID = int(os.getenv("OWNER_ID", 8780228920))
 UZB_TZ = ZoneInfo("Asia/Tashkent")
 
+# Optional: file_id of the funny sticker shown when there are no lessons left today.
+# (Send any sticker to the bot as the owner and it replies with its file_id.)
 FUNNY_STICKER_ID = os.getenv("FUNNY_STICKER_ID", "").strip()
 
-# ======================================================================
-#  SUPABASE ASYNCPG POOL + SYNCHRONOUS BRIDGE FOR COMMAND.PY
-# ======================================================================
-_orig_create_pool = asyncpg.create_pool
+# Ensure the data directory exists
+os.makedirs("data", exist_ok=True)
 
-
-def _clean_dsn(dsn: str) -> str:
-    dsn = dsn.strip()
-    for suffix in ("?statement_cache_size=0", "&statement_cache_size=0"):
-        dsn = dsn.replace(suffix, "")
-    return dsn
-
-
-async def _patched_create_pool(dsn=None, *args, **kwargs):
-    kwargs.setdefault("statement_cache_size", 0)
-    if isinstance(dsn, str):
-        dsn = _clean_dsn(dsn)
-    try:
-        return await _orig_create_pool(dsn, *args, **kwargs)
-    except Exception as first_err:
-        if isinstance(dsn, str) and "@db.lmgsxyyhybjuosaxzfco.supabase.co" in dsn:
-            logging.warning(f"Direct IPv6 host unreachable ({first_err}); switching to Supabase IPv4 pooler...")
-            pooler_dsn = (
-                dsn.replace("postgresql://postgres:", "postgresql://postgres.lmgsxyyhybjuosaxzfco:")
-                .replace("@db.lmgsxyyhybjuosaxzfco.supabase.co:5432", "@aws-0-ap-northeast-2.pooler.supabase.com:6543")
-            )
-            return await _orig_create_pool(pooler_dsn, *args, **kwargs)
-        raise
-
-
-# Ensure any asyncpg.create_pool call in main.py automatically disables prepared statement cache
-asyncpg.create_pool = _patched_create_pool
-
-db_pool: asyncpg.Pool | None = None
-
-# Dedicated background event loop so synchronous functions in command.py & schedule.py work seamlessly
-_bg_loop = asyncio.new_event_loop()
-_bg_thread = threading.Thread(target=_bg_loop.run_forever, daemon=True)
-_bg_thread.start()
-_bg_pool: asyncpg.Pool | None = None
-
-
-async def _ensure_bg_pool() -> asyncpg.Pool:
-    global _bg_pool
-    if _bg_pool is None:
-        dsn = _clean_dsn(os.getenv("DATABASE_URL", ""))
-        if not dsn:
-            raise RuntimeError("DATABASE_URL is not set.")
-        _bg_pool = await _patched_create_pool(dsn, min_size=1, max_size=5)
-    return _bg_pool
-
-
-def _run_db(coro):
-    return asyncio.run_coroutine_threadsafe(coro, _bg_loop).result()
-
-
-class _DualBool:
-    """Works both in synchronous `if is_banned(uid):` and asynchronous `if await is_banned(uid):`."""
-    def __init__(self, val: bool):
-        self.val = bool(val)
-
-    def __bool__(self) -> bool:
-        return self.val
-
-    def __await__(self):
-        async def _coro():
-            return self.val
-        return _coro().__await__()
-
-
-def _translate_sql(sql: str) -> str:
-    s = sql.strip()
-    s = re.sub(r"COLLATE\s+NOCASE", 'COLLATE "C"', s, flags=re.IGNORECASE)
-
-    if re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", s, flags=re.IGNORECASE):
-        s = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, flags=re.IGNORECASE)
-        s += " ON CONFLICT DO NOTHING"
-    elif re.match(r"^INSERT\s+OR\s+REPLACE\s+INTO", s, flags=re.IGNORECASE):
-        s = re.sub(r"^INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", s, flags=re.IGNORECASE)
-        low = s.lower()
-        if "into bot_settings" in low:
-            s += " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-        elif "into class_overrides" in low:
-            s += " ON CONFLICT (class_id, day_date, lesson) DO UPDATE SET kind = EXCLUDED.kind, note = EXCLUDED.note"
-        elif "into class_timetable" in low:
-            s += " ON CONFLICT (class_id, day, pos) DO UPDATE SET subject = EXCLUDED.subject, room = EXCLUDED.room, teachers = EXCLUDED.teachers"
-        elif "into teacher_timetable" in low:
-            s += " ON CONFLICT (teacher_key, day, lesson) DO UPDATE SET class_label = EXCLUDED.class_label, class_id = EXCLUDED.class_id, subject = EXCLUDED.subject, room = EXCLUDED.room"
-
-    idx = 0
-    out = []
-    for ch in s:
-        if ch == "?":
-            idx += 1
-            out.append(f"${idx}")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-class _CursorAdapter:
-    def __init__(self):
-        self._rows: list[tuple] = []
-        self._idx: int = 0
-        self.rowcount: int = 0
-
-    def execute(self, sql: str, params: tuple | list = ()):
-        pg_sql = _translate_sql(sql)
-        args = list(params)
-
-        async def _do():
-            pool = await _ensure_bg_pool()
-            async with pool.acquire() as c:
-                upper = pg_sql.lstrip().upper()
-                if upper.startswith("SELECT") or upper.startswith("WITH"):
-                    records = await c.fetch(pg_sql, *args)
-                    return [tuple(r) for r in records], len(records)
-                status = await c.execute(pg_sql, *args)
-                count = 0
-                if status:
-                    parts = status.split()
-                    if parts and parts[-1].isdigit():
-                        count = int(parts[-1])
-                return [], count
-
-        self._rows, self.rowcount = _run_db(_do())
-        self._idx = 0
-        return self
-
-    def fetchone(self):
-        if self._idx < len(self._rows):
-            row = self._rows[self._idx]
-            self._idx += 1
-            return row
-        return None
-
-    def fetchall(self):
-        rest = self._rows[self._idx:]
-        self._idx = len(self._rows)
-        return rest
-
-
-class _ConnAdapter:
-    def cursor(self):
-        return cursor
-
-    def commit(self):
-        pass
-
-
-cursor = _CursorAdapter()
-conn = _ConnAdapter()
-
-
-async def init_db_pool() -> asyncpg.Pool:
-    global db_pool
-    if db_pool is not None:
-        return db_pool
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    if not database_url:
-        raise SystemExit("DATABASE_URL is not set. Add it as an environment variable.")
-    db_pool = await asyncpg.create_pool(database_url, statement_cache_size=0)
-    return db_pool
-
+# Save SQLite database inside the persistent volume folder
+conn = sqlite3.connect("data/subscribers.db", check_same_thread=False)
+cursor = conn.cursor()
 
 # ======================================================================
 #  DATABASE SETUP
 # ======================================================================
-async def setup_database(pool: asyncpg.Pool):
-    async with pool.acquire() as c:
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                role TEXT DEFAULT 'user'
-            )
-        """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        role TEXT DEFAULT 'user'
+    )
+""")
 
-        async def ensure_column(table: str, column: str, ddl: str):
-            await c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}")
 
-        await ensure_column("users", "is_active", "INTEGER DEFAULT 1")
-        await ensure_column("users", "banned", "INTEGER DEFAULT 0")
-        await ensure_column("users", "morning_alert", "INTEGER DEFAULT 1")
-        await ensure_column("users", "lesson_alerts", "INTEGER DEFAULT 1")
-        await ensure_column("users", "announcements", "INTEGER DEFAULT 1")
-        await ensure_column("users", "class_id", "TEXT")
-        await ensure_column("users", "teacher_key", "TEXT")
-        await ensure_column("users", "admin_class", "TEXT")
-        await ensure_column("users", "menu_shown", "INTEGER DEFAULT 0")
+def ensure_column(table: str, column: str, ddl: str):
+    """Adds a column to an existing table if it is missing (safe migration)."""
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = [row[1] for row in cursor.fetchall()]
+    if column not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS class_timetable (
-                class_id TEXT,
-                day INTEGER,
-                pos INTEGER,
-                subject TEXT,
-                room TEXT,
-                teachers TEXT,
-                PRIMARY KEY (class_id, day, pos)
-            )
-        """)
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS class_overrides (
-                class_id TEXT,
-                day_date TEXT,
-                lesson INTEGER,
-                kind TEXT,
-                note TEXT,
-                PRIMARY KEY (class_id, day_date, lesson)
-            )
-        """)
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS teacher_timetable (
-                teacher_key TEXT,
-                day INTEGER,
-                lesson INTEGER,
-                class_label TEXT,
-                class_id TEXT,
-                subject TEXT,
-                room TEXT,
-                PRIMARY KEY (teacher_key, day, lesson)
-            )
-        """)
-        await ensure_column("teacher_timetable", "room", "TEXT")
 
+ensure_column("users", "is_active", "INTEGER DEFAULT 1")
+ensure_column("users", "banned", "INTEGER DEFAULT 0")
+ensure_column("users", "morning_alert", "INTEGER DEFAULT 1")
+ensure_column("users", "lesson_alerts", "INTEGER DEFAULT 1")
+ensure_column("users", "announcements", "INTEGER DEFAULT 1")
+ensure_column("users", "class_id", "TEXT")
+ensure_column("users", "teacher_key", "TEXT")          # set only by the owner (/setteacher)
+ensure_column("users", "admin_class", "TEXT")          # class admin: admin of ONE class only
+ensure_column("users", "menu_shown", "INTEGER DEFAULT 0")
+ensure_column("users", "inbox_on", "INTEGER DEFAULT 1")       # admin: does he get the students' messages (/inbox)?
+
+# Every class has its OWN timetable and its OWN overrides (nothing is shared or merged)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS class_timetable (
+        class_id TEXT,
+        day INTEGER,
+        pos INTEGER,
+        subject TEXT,
+        room TEXT,
+        teachers TEXT,
+        PRIMARY KEY (class_id, day, pos)
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS class_overrides (
+        class_id TEXT,
+        day_date TEXT,
+        lesson INTEGER,
+        kind TEXT,
+        note TEXT,
+        PRIMARY KEY (class_id, day_date, lesson)
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+""")
+# Teacher timetables (one row = one lesson slot of one teacher; slots may have gaps)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS teacher_timetable (
+        teacher_key TEXT,
+        day INTEGER,
+        lesson INTEGER,
+        class_label TEXT,
+        class_id TEXT,
+        subject TEXT,
+        room TEXT,
+        PRIMARY KEY (teacher_key, day, lesson)
+    )
+""")
+ensure_column("teacher_timetable", "room", "TEXT")   # databases made by an older version get the column
+conn.commit()
 
 # Notification settings users can toggle in /settings
 SETTING_LABELS = {
@@ -327,12 +178,15 @@ DAY_CODE_MAP = {
     "6": 5, "sh": 5, "shanba": 5, "sat": 5, "saturday": 5,
 }
 
+# Classes (like 10-E) and teachers can have Saturday lessons, so they share the same day tables
 TEACHER_DAY_NAMES = DAY_NAMES
 TEACHER_DAY_CODE_MAP = DAY_CODE_MAP
 
 # ======================================================================
-#  CLASSES
+#  CLASSES  (add a new class = add one block here, nothing else changes)
 # ======================================================================
+
+# --- 10-B aniq (the original schedule, unchanged) ---
 BELLS_10B = [
     {"lesson": 1, "start": "09:00", "end": "09:45"},
     {"lesson": 2, "start": "09:50", "end": "10:35"},
@@ -389,6 +243,8 @@ DEFAULT_TIMETABLE_10B = {
 }
 
 # --- 10-A aniq ---
+# Same bell times as 10-B for lessons 1-7. Monday has an 8th lesson, so it gets one
+# extra slot right after the 7th (5-minute break, 45-minute lesson, like the rest).
 BELLS_10A = [dict(b) for b in BELLS_10B] + [
     {"lesson": 8, "start": "15:15", "end": "16:00"},
 ]
@@ -439,6 +295,7 @@ DEFAULT_TIMETABLE_10A = {
 }
 
 # --- 10-E umumta'lim ---
+# The printout starts at 8:30, but the bot uses the SAME bell times as the other classes (start 09:00).
 BELLS_10E = [dict(b) for b in BELLS_10B]
 
 DEFAULT_TIMETABLE_10E = {
@@ -489,6 +346,8 @@ DEFAULT_TIMETABLE_10E = {
 }
 
 # --- 10-01 and 10-02 ---
+# The printouts already use the same bell times as the other classes (09:00 - 15:10, 7 lessons).
+# There are no rooms in these two timetables: room = "" (the bot then simply does not show a room).
 BELLS_1001 = [dict(b) for b in BELLS_10B]
 BELLS_1002 = [dict(b) for b in BELLS_10B]
 
@@ -593,6 +452,7 @@ DEFAULT_TIMETABLE_1002 = {
     ],
 }
 
+# "morning" = time of the morning alert
 CLASSES = {
     "10a": {
         "name": "10-A aniq",
@@ -615,7 +475,7 @@ CLASSES = {
         "bells": BELLS_10E,
         "default": DEFAULT_TIMETABLE_10E,
     },
-    "1001": {
+    "1001": {                      # typed as 10-01 or 1001 (hyphens are ignored)
         "name": "10-01",
         "short": "10-01",
         "morning": "08:00",
@@ -632,18 +492,22 @@ CLASSES = {
 }
 
 # ======================================================================
-#  TEACHERS
+#  TEACHERS  (add a new teacher = add one block here)
+#  Teacher lessons use the SAME bell times as the classes.
 # ======================================================================
-TEACHER_BELLS = [dict(b) for b in BELLS_10A]
+TEACHER_BELLS = [dict(b) for b in BELLS_10A]  # 8 slots
 
 
 def _tl(lesson: int, klass: str, class_id: str | None = None, subject: str = "Informatika",
         room: str | None = None) -> dict:
+    """One teacher lesson. class_id is set only for classes that exist in the bot (10a / 10b / 10e)
+    so a holiday of that class also cancels the lesson for the teacher."""
     return {"lesson": lesson, "class": klass, "class_id": class_id, "subject": subject, "room": room}
 
 
+# Madrimov Umarbek (ICT teacher)
 TIMETABLE_UMARBEK = {
-    0: [
+    0: [  # Dushanba
         _tl(2, "10-B aniq", "10b", "Kelajak soati"),
         _tl(3, "11-A aniq"),
         _tl(4, "10-B aniq", "10b"),
@@ -651,21 +515,21 @@ TIMETABLE_UMARBEK = {
         _tl(6, "8-B aniq"),
         _tl(7, "7-D tabiiy"),
     ],
-    1: [
+    1: [  # Seshanba
         _tl(2, "11-A aniq"),
         _tl(3, "10-D umumta'lim"),
         _tl(5, "5-B"),
         _tl(7, "8-D tabiiy"),
     ],
-    2: [
+    2: [  # Chorshanba
         _tl(1, "11-B aniq"),
         _tl(4, "9-A aniq"),
         _tl(7, "10-G tabiiy"),
     ],
-    3: [
+    3: [  # Payshanba
         _tl(6, "8-A aniq"),
     ],
-    4: [
+    4: [  # Juma
         _tl(1, "7-B aniq"),
         _tl(2, "11-B aniq"),
         _tl(3, "9-A aniq"),
@@ -673,18 +537,18 @@ TIMETABLE_UMARBEK = {
         _tl(5, "6-B aniq"),
         _tl(6, "10-B aniq", "10b"),
     ],
-    5: [
+    5: [  # Shanba
         _tl(2, "10-D umumta'lim"),
     ],
 }
 
-
+# Saidova O'g'iljon (physics) - lessons with rooms
 def _ph(lesson: int, klass: str, room: str, class_id: str | None = None) -> dict:
     return _tl(lesson, klass, class_id, "Fizika", room)
 
 
 TIMETABLE_OGILJON = {
-    0: [
+    0: [  # Dushanba
         _ph(1, "11-A aniq", "202"),
         _ph(2, "10-B sinf (1-kichik guruh)", "Dežurka", "10b"),
         _ph(3, "8-A aniq", "206"),
@@ -692,7 +556,7 @@ TIMETABLE_OGILJON = {
         _ph(6, "11-A aniq", "202"),
         _ph(8, "10-A aniq", "202", "10a"),
     ],
-    1: [
+    1: [  # Seshanba
         _ph(2, "11-B aniq", "206"),
         _ph(3, "11-A aniq", "202"),
         _ph(4, "10-A aniq", "202", "10a"),
@@ -700,14 +564,14 @@ TIMETABLE_OGILJON = {
         _ph(6, "9-D tabiiy", "202"),
         _ph(7, "10-B aniq", "207", "10b"),
     ],
-    2: [
+    2: [  # Chorshanba
         _ph(1, "10-A aniq", "202", "10a"),
         _ph(2, "11-A aniq", "202"),
         _ph(3, "10-B aniq", "207", "10b"),
         _ph(5, "7-B aniq", "207"),
         _ph(8, "11-B aniq", "202"),
     ],
-    3: [
+    3: [  # Payshanba
         _ph(1, "10-A aniq", "202", "10a"),
         _ph(2, "10-B aniq", "207", "10b"),
         _ph(3, "8-A aniq", "202"),
@@ -715,7 +579,7 @@ TIMETABLE_OGILJON = {
         _ph(5, "11-B aniq", "206"),
         _ph(6, "11-A aniq", "202"),
     ],
-    4: [
+    4: [  # Juma
         _ph(2, "11-A aniq", "202"),
         _ph(4, "10-B aniq", "202", "10b"),
         _ph(5, "7-B aniq", "202"),
@@ -725,36 +589,38 @@ TIMETABLE_OGILJON = {
 }
 
 
+# Olloyorov Muhammadsodiq (maths): "Matematika" in grades 1-6, from grade 7 it is split into
+# "Algebra" and "Geometriya". Every lesson is in room 217.
 def _math(lesson: int, klass: str, subject: str, class_id: str | None = None) -> dict:
     return _tl(lesson, klass, class_id, subject, "217")
 
 
 TIMETABLE_MUHAMMADSODIQ = {
-    0: [
+    0: [  # 1-kun: Dushanba
         _math(1, "10-B", "Algebra", "10b"),
         _math(2, "6-A", "Matematika"),
         _math(3, "11-B", "Algebra"),
         _math(4, "11-B", "Geometriya"),
     ],
-    1: [
+    1: [  # 2-kun: Seshanba
         _math(1, "6-A", "Matematika"),
         _math(2, "6-A", "Matematika"),
         _math(3, "10-B", "Algebra", "10b"),
         _math(4, "10-B", "Geometriya", "10b"),
     ],
-    2: [
+    2: [  # 3-kun: Chorshanba
         _math(1, "6-B", "Matematika"),
         _math(2, "10-B", "Algebra", "10b"),
         _math(3, "11-B", "Algebra"),
         _math(4, "11-B", "Geometriya"),
     ],
-    3: [
+    3: [  # 4-kun: Payshanba
         _math(1, "6-A", "Matematika"),
         _math(2, "6-A", "Matematika"),
         _math(3, "10-B", "Algebra", "10b"),
         _math(4, "10-B", "Geometriya", "10b"),
     ],
-    4: [
+    4: [  # 5-kun: Juma
         _math(1, "6-A", "Matematika"),
         _math(2, "10-B", "Geometriya", "10b"),
         _math(3, "11-B", "Algebra"),
@@ -768,9 +634,9 @@ TEACHERS = {
         "short": "Umarbek",
         "subject": "Informatika",
         "morning": "08:00",
-        "remind_before": 5,
-        "default": TIMETABLE_UMARBEK,
-        "timetable": {},
+        "remind_before": 5,             # minutes before EVERY lesson: "you are going to teach class X"
+        "default": TIMETABLE_UMARBEK,   # copied into the database on the first run only
+        "timetable": {},                # live timetable, loaded from the database
     },
     "ogiljon": {
         "name": "Saidova O'g'iljon",
@@ -778,7 +644,7 @@ TEACHERS = {
         "subject": "Fizika",
         "morning": "08:00",
         "remind_before": 5,
-        "aliases": ["o'g'lijon"],
+        "aliases": ["o'g'lijon"],       # other spelling of the name
         "default": TIMETABLE_OGILJON,
         "timetable": {},
     },
@@ -786,7 +652,7 @@ TEACHERS = {
         "name": "Olloyorov Muhammadsodiq",
         "short": "Muhammadsodiq",
         "subject": "Matematika",
-        "always_show_subject": True,
+        "always_show_subject": True,    # he teaches Matematika / Algebra / Geometriya: always show which one
         "morning": "08:00",
         "remind_before": 5,
         "aliases": ["sodiq"],
@@ -798,15 +664,18 @@ TEACHERS = {
 # ======================================================================
 #  CLASS TIMETABLES: migration, seeding, loading
 # ======================================================================
+# Live timetables used by the whole bot: TIMETABLES[class_id][weekday] -> list of lessons
 TIMETABLES: dict[str, dict[int, list[dict]]] = {}
 
 
 def table_exists(name: str) -> bool:
-    cursor.execute("SELECT 1 FROM information_schema.tables WHERE table_name = ?", (name,))
+    cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
     return cursor.fetchone() is not None
 
 
 def migrate_to_multiclass():
+    """One-time: the old single-class data (10-B) becomes the data of class 10b,
+    and all existing users stay on 10-B so nothing changes for them."""
     if get_setting("multiclass_migrated") == "1":
         return
     if table_exists("timetable"):
@@ -825,6 +694,7 @@ def migrate_to_multiclass():
 
 
 def seed_class_if_needed(class_id: str):
+    """Copies the default timetable of a class into the database (only once per class)."""
     if get_setting(f"seeded_{class_id}") == "1":
         return
     cursor.execute("SELECT COUNT(*) FROM class_timetable WHERE class_id = ?", (class_id,))
@@ -832,7 +702,7 @@ def seed_class_if_needed(class_id: str):
         for day, lessons in CLASSES[class_id]["default"].items():
             for pos, item in enumerate(lessons, start=1):
                 cursor.execute(
-                    "INSERT OR IGNORE INTO class_timetable (class_id, day, pos, subject, room, teachers) "
+                    "INSERT INTO class_timetable (class_id, day, pos, subject, room, teachers) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (class_id, day, pos, item["subject"], item["room"], item["teachers"]),
                 )
@@ -841,6 +711,7 @@ def seed_class_if_needed(class_id: str):
 
 
 def load_timetable():
+    """Reloads TIMETABLES from the database (only days that have lessons)."""
     fresh: dict[str, dict[int, list[dict]]] = {cid: {} for cid in CLASSES}
     cursor.execute(
         "SELECT class_id, day, pos, subject, room, teachers FROM class_timetable ORDER BY class_id, day, pos"
@@ -852,7 +723,14 @@ def load_timetable():
     TIMETABLES.update(fresh)
 
 
+migrate_to_multiclass()
+for _cid in CLASSES:
+    seed_class_if_needed(_cid)
+load_timetable()
+
+
 def seed_teacher_if_needed(teacher_key: str):
+    """Copies the default lessons of a teacher into the database (only once per teacher)."""
     if get_setting(f"seeded_teacher_{teacher_key}") == "1":
         return
     cursor.execute("SELECT COUNT(*) FROM teacher_timetable WHERE teacher_key = ?", (teacher_key,))
@@ -860,7 +738,7 @@ def seed_teacher_if_needed(teacher_key: str):
         for day, lessons in TEACHERS[teacher_key]["default"].items():
             for item in lessons:
                 cursor.execute(
-                    "INSERT OR IGNORE INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject, room) "
+                    "INSERT INTO teacher_timetable (teacher_key, day, lesson, class_label, class_id, subject, room) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (teacher_key, day, item["lesson"], item["class"], item["class_id"], item["subject"],
                      item.get("room")),
@@ -870,6 +748,7 @@ def seed_teacher_if_needed(teacher_key: str):
 
 
 def load_teacher_timetables():
+    """Reloads the lessons of every teacher from the database."""
     fresh: dict[str, dict[int, list[dict]]] = {key: {} for key in TEACHERS}
     cursor.execute(
         "SELECT teacher_key, day, lesson, class_label, class_id, subject, room FROM teacher_timetable "
@@ -884,14 +763,9 @@ def load_teacher_timetables():
         TEACHERS[key]["timetable"] = fresh[key]
 
 
-async def initialize_all_schedules():
-    await asyncio.to_thread(migrate_to_multiclass)
-    for _cid in CLASSES:
-        await asyncio.to_thread(seed_class_if_needed, _cid)
-    await asyncio.to_thread(load_timetable)
-    for _tkey in TEACHERS:
-        await asyncio.to_thread(seed_teacher_if_needed, _tkey)
-    await asyncio.to_thread(load_teacher_timetables)
+for _tkey in TEACHERS:
+    seed_teacher_if_needed(_tkey)
+load_teacher_timetables()
 
 
 def class_bells(class_id: str) -> list[dict]:
@@ -907,6 +781,7 @@ def class_name(class_id: str | None) -> str:
 
 
 def class_token(raw: str | None) -> str | None:
+    """'10a', '10-A', '10B' -> '10a' / '10b' (None if it is not a class code)."""
     if not raw:
         return None
     token = raw.lower().replace("-", "")
@@ -914,15 +789,19 @@ def class_token(raw: str | None) -> str | None:
 
 
 def class_id_from_label(label: str) -> str | None:
+    """'10-B aniq' / '10b' -> '10b' when it is a class of the bot (so that class holidays also
+    cancel the teacher's lesson), otherwise None (e.g. '9-A aniq')."""
     words = label.split()
     return class_token(words[0]) if words else None
 
 
 def _plain(text: str) -> str:
+    """Lower case without apostrophes: O'g'iljon = o’g’iljon = ogiljon."""
     return text.lower().translate(str.maketrans("", "", "'`ʻʼ’‘"))
 
 
 def teacher_token(raw: str | None) -> str | None:
+    """'Umarbek', "O'g'iljon", 'saidova', 'Muhammadsodiq' -> the teacher key (None if unknown)."""
     if not raw:
         return None
     token = _plain(raw)
@@ -943,10 +822,10 @@ def register_or_update_user(user_id: int, username: str, first_name: str):
         INSERT INTO users (user_id, username, first_name, role)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-            username=EXCLUDED.username,
-            first_name=EXCLUDED.first_name,
+            username=excluded.username,
+            first_name=excluded.first_name,
             is_active=1,
-            role=CASE WHEN users.user_id = ? THEN 'owner' ELSE users.role END
+            role=CASE WHEN user_id = ? THEN 'owner' ELSE users.role END
     """, (user_id, username or "NoUsername", first_name or "User", role, OWNER_ID))
     conn.commit()
 
@@ -972,11 +851,14 @@ def get_all_users():
 
 
 def set_user_role(user_id: int, role: str):
+    """Changing the role always clears a class-admin scope (use set_class_admin for class admins)."""
     cursor.execute("UPDATE users SET role = ?, admin_class = NULL WHERE user_id = ?", (role, int(user_id)))
     conn.commit()
 
 
+# --- class admins: an admin who manages ONE class only ---
 def get_admin_class(user_id: int) -> str | None:
+    """The class a class-admin is responsible for. None for the owner, global admins and normal users."""
     if int(user_id) == OWNER_ID:
         return None
     cursor.execute("SELECT role, admin_class FROM users WHERE user_id = ?", (int(user_id),))
@@ -987,10 +869,12 @@ def get_admin_class(user_id: int) -> str | None:
 
 
 def is_global_admin(user_id: int) -> bool:
+    """Owner or an admin without a class limit."""
     return is_admin_or_owner(user_id) and get_admin_class(user_id) is None
 
 
 def set_class_admin(user_id: int, class_id: str):
+    """Makes the user an admin of ONE class. If he has no class yet he is put into that class."""
     cursor.execute(
         "UPDATE users SET role = 'admin', admin_class = ? WHERE user_id = ?", (class_id, int(user_id))
     )
@@ -1001,6 +885,8 @@ def set_class_admin(user_id: int, class_id: str):
 
 
 def can_manage_user(admin_id: int, target_id: int) -> bool:
+    """Owner and global admins may manage anybody. A class admin only the students of his own class
+    (never admins, the owner or teachers)."""
     admin_class = get_admin_class(admin_id)
     if admin_class is None:
         return is_admin_or_owner(admin_id)
@@ -1021,10 +907,10 @@ def parse_id(raw) -> int | None:
         return None
 
 
-def is_banned(user_id: int) -> _DualBool:
+def is_banned(user_id: int) -> bool:
     cursor.execute("SELECT banned FROM users WHERE user_id = ?", (int(user_id),))
     row = cursor.fetchone()
-    return _DualBool(bool(row and row[0]))
+    return bool(row and row[0])
 
 
 def set_banned(user_id: int, value: bool):
@@ -1049,6 +935,7 @@ def set_user_class(user_id: int, class_id: str):
     conn.commit()
 
 
+# --- teachers (assigned only by the owner) ---
 def get_user_teacher(user_id: int) -> str | None:
     cursor.execute("SELECT teacher_key FROM users WHERE user_id = ?", (int(user_id),))
     row = cursor.fetchone()
@@ -1057,6 +944,7 @@ def get_user_teacher(user_id: int) -> str | None:
 
 
 def set_user_teacher(user_id: int, teacher_key: str):
+    """Makes the user a teacher: no class, new (teacher) menu."""
     cursor.execute(
         "UPDATE users SET teacher_key = ?, class_id = NULL, menu_shown = 0 WHERE user_id = ?",
         (teacher_key, int(user_id)),
@@ -1087,7 +975,69 @@ def mark_menu_shown(user_id: int, value: bool = True):
     conn.commit()
 
 
+# --- inbox: messages that people write to the bot are forwarded to admins ---
+def is_inbox_on(user_id: int) -> bool:
+    """Does this admin (or the owner) want the messages? On by default."""
+    cursor.execute("SELECT inbox_on FROM users WHERE user_id = ?", (int(user_id),))
+    row = cursor.fetchone()
+    return True if row is None or row[0] is None else bool(row[0])
+
+
+def set_inbox(user_id: int, value: bool):
+    cursor.execute("UPDATE users SET inbox_on = ? WHERE user_id = ?", (1 if value else 0, int(user_id)))
+    conn.commit()
+
+
+def get_inbox_recipients(sender_id: int) -> list[int]:
+    """Who gets a message that 'sender_id' wrote to the bot (only those with /inbox on).
+      * the owner always gets everything (if his inbox is on)
+      * main admins get the messages of all students
+      * a class admin gets only the messages of the students of HIS class
+      * messages of admins and of teachers go to the owner only (teacher mode stays hidden)"""
+    sender_id = int(sender_id)
+    if sender_id == OWNER_ID:
+        return []
+
+    recipients = set()
+    if is_inbox_on(OWNER_ID):
+        recipients.add(OWNER_ID)
+
+    is_student = get_user_role(sender_id) != "admin" and not get_user_teacher(sender_id)
+    if is_student:
+        class_id = get_user_class(sender_id)
+        cursor.execute(
+            "SELECT user_id, admin_class FROM users "
+            "WHERE role = 'admin' AND is_active = 1 AND banned = 0 AND inbox_on = 1"
+        )
+        for admin_id, admin_class in cursor.fetchall():
+            if admin_id == sender_id:
+                continue
+            if admin_class in CLASSES:          # class admin: only his own class
+                if class_id == admin_class:
+                    recipients.add(admin_id)
+            else:                               # main admin: everybody
+                recipients.add(admin_id)
+
+    recipients.discard(sender_id)
+    return sorted(recipients)
+
+
+def migrate_inbox_setting():
+    """One-time: the old global '/inbox off' of the owner becomes the owner's personal setting."""
+    if get_setting("inbox_migrated") == "1":
+        return
+    if get_setting("inbox", "on") == "off":
+        cursor.execute("UPDATE users SET inbox_on = 0 WHERE user_id = ?", (OWNER_ID,))
+        conn.commit()
+    set_setting("inbox_migrated", "1")
+
+
+migrate_inbox_setting()
+
+
+# --- recipients ---
 def get_recipients(flag: str | None = None, class_id: str | None = None) -> list[int]:
+    """Active, non-banned users. Optionally only one class / only those with a setting switched on."""
     query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
     params: list = []
     if flag in SETTING_LABELS:
@@ -1108,6 +1058,8 @@ def get_teacher_recipients(teacher_key: str, flag: str | None = None) -> list[in
 
 
 def get_audience_recipients(audience: str, flag: str | None = "announcements") -> list[int]:
+    """Who gets a broadcast.
+    audience = 'all' (everybody) | 'students' (everybody except teachers) | 'teachers' | a class id ('10a')."""
     query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
     params: list = []
     if audience == "students":
@@ -1126,6 +1078,8 @@ def get_audience_recipients(audience: str, flag: str | None = "announcements") -
 
 
 def users_scope_where(scope: str, include_teachers: bool):
+    """SQL filter of a /users window. scope = a class id | 'none' | 'teachers' | 'all'.
+    Teachers are only visible when include_teachers is True (= the viewer is the owner)."""
     if scope == "teachers":
         return ("teacher_key IS NOT NULL", []) if include_teachers else None
     if scope == "none":
@@ -1169,6 +1123,7 @@ def get_settings(user_id: int) -> dict:
 
 
 def subscribe_if_stopped(user_id: int):
+    """/start turns alerts back on for someone who had used /stop."""
     settings = get_settings(user_id)
     if not any(settings.values()):
         cursor.execute(
@@ -1182,6 +1137,7 @@ def subscribe_if_stopped(user_id: int):
 #  DATE / OVERRIDE HELPERS
 # ======================================================================
 def parse_date(raw: str | None) -> date | None:
+    """Accepts YYYY-MM-DD, 'bugun' / 'today', 'ertaga' / 'tomorrow'."""
     if not raw:
         return None
     raw = raw.strip().lower()
@@ -1197,16 +1153,20 @@ def parse_date(raw: str | None) -> date | None:
 
 
 def week_start(today: date) -> date:
+    """Monday of this week (on Saturday/Sunday: Monday of the coming week)."""
     wd = today.weekday()
     return today - timedelta(days=wd) if wd < 5 else today + timedelta(days=7 - wd)
 
 
 def teacher_week_start(today: date) -> date:
+    """Monday of this week (on Sunday: Monday of the coming week). Saturday still counts."""
     wd = today.weekday()
     return today - timedelta(days=wd) if wd < 6 else today + timedelta(days=1)
 
 
 def class_week_start(class_id: str, today: date) -> date:
+    """Monday of the week to show for a class. Sunday always shows the coming week; Saturday does too,
+    unless the class has Saturday lessons (then the current week is still in progress)."""
     wd = today.weekday()
     has_saturday = 5 in class_timetable(class_id)
     if wd == 6 or (wd == 5 and not has_saturday):
@@ -1215,6 +1175,7 @@ def class_week_start(class_id: str, today: date) -> date:
 
 
 def get_off_reason(class_id: str, d: date) -> str | None:
+    """Returns the reason if the day is marked 'no school' for this class, otherwise None."""
     cursor.execute(
         "SELECT note FROM class_overrides WHERE class_id = ? AND day_date = ? AND lesson = 0 AND kind = 'off'",
         (class_id, d.isoformat()),
@@ -1232,6 +1193,7 @@ def get_notes(class_id: str, d: date) -> dict[int, str]:
 
 
 def school_off(d: date) -> bool:
+    """True when EVERY class of the bot has a holiday on that date (= school-wide holiday)."""
     return all(get_off_reason(cid, d) is not None for cid in CLASSES)
 
 
@@ -1260,6 +1222,7 @@ def day_label(d: date, today: date) -> str:
 #  CLASS SCHEDULE: lessons, texts
 # ======================================================================
 def effective_lessons(class_id: str, d: date) -> list[dict]:
+    """Lessons that really take place for a class on a date (none on weekends/holidays)."""
     timetable = class_timetable(class_id)
     wd = d.weekday()
     if wd not in timetable or get_off_reason(class_id, d) is not None:
@@ -1322,6 +1285,7 @@ def format_week(class_id: str, start: date) -> str:
     return text
 
 
+# --- now / next / time left (students) ---
 NO_LESSONS_LEFT_TEXT = "🏁 <b>Bugun uchun darslar qolmadi.</b>"
 JOKE_TEXT = "Shu malli ham adam o'qimi eee 😄"
 
@@ -1339,6 +1303,7 @@ def find_current(class_id: str, now: datetime):
 
 
 def find_next(class_id: str, now: datetime, days: int = 8):
+    """Next lesson that starts after 'now'. days=1 means: today only."""
     bells = class_bells(class_id)
     for offset in range(0, days):
         d = now.date() + timedelta(days=offset)
@@ -1377,13 +1342,15 @@ def next_lesson_text(class_id: str, now: datetime) -> str:
 
 
 def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
+    """Text for /now. The bool is True when no lessons are left today (the bot then also
+    sends the funny sticker)."""
     bells = class_bells(class_id)
     lessons = effective_lessons(class_id, now.date())
     if not lessons:
         return "🎉 <b>Bugun dars yo'q.</b>\nKeyingi dars: /next", False
 
     current = find_current(class_id, now)
-    upcoming = find_next(class_id, now, days=1)
+    upcoming = find_next(class_id, now, days=1)  # today only
 
     if current:
         idx, item, end = current
@@ -1411,6 +1378,7 @@ def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
 
 
 def class_time_left_text(class_id: str, now: datetime) -> str:
+    """Text for the 'how much time left' button."""
     bells = class_bells(class_id)
     lessons = effective_lessons(class_id, now.date())
     if not lessons:
@@ -1447,6 +1415,8 @@ def teacher_bell(lesson_num: int) -> dict:
 
 
 def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
+    """Lessons the teacher really has on a date. Lessons are cancelled when that class
+    has a holiday, and everything is cancelled on a school-wide holiday."""
     lessons = TEACHERS[teacher_key]["timetable"].get(d.weekday(), [])
     if not lessons or school_off(d):
         return []
@@ -1460,6 +1430,8 @@ def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
 
 
 def _subject_shown(teacher_key: str, item: dict) -> bool:
+    """Show the subject of a teacher lesson? Always for teachers with several subjects
+    (Matematika / Algebra / Geometriya), otherwise only when it differs from the main subject."""
     cfg = TEACHERS[teacher_key]
     return bool(cfg.get("always_show_subject")) or item["subject"] != cfg["subject"]
 
@@ -1520,6 +1492,7 @@ def format_teacher_week(teacher_key: str, start: date) -> str:
 
 
 def format_teacher_timetable(teacher_key: str) -> str:
+    """The saved weekly timetable of a teacher, exactly as stored (no holidays applied)."""
     cfg = TEACHERS[teacher_key]
     text = f"🗓 <b>{esc(cfg['name'])}</b> — dars jadvali\n\n"
     for wd in range(6):
@@ -1589,6 +1562,8 @@ def teacher_next_text(teacher_key: str, now: datetime) -> str:
 
 
 def teacher_now_text(teacher_key: str, now: datetime) -> str:
+    """Current lesson of the teacher: the class if he has a lesson, otherwise
+    'sizda hozir dars yo'q - bekorsiz' and the time of the next lesson under it."""
     current = find_teacher_current(teacher_key, now)
     if current:
         item, end = current
@@ -1608,7 +1583,7 @@ def teacher_now_text(teacher_key: str, now: datetime) -> str:
             note = get_notes(item["class_id"], now.date()).get(item["lesson"])
             if note:
                 text += f"\n⚠️ <b>{esc(note)}</b>"
-        upcoming = find_teacher_next(teacher_key, now, days=1)
+        upcoming = find_teacher_next(teacher_key, now, days=1)  # today only
         if upcoming:
             text += "\n\n" + _teacher_next_block(teacher_key, upcoming, now)
         else:
@@ -1622,6 +1597,7 @@ def teacher_now_text(teacher_key: str, now: datetime) -> str:
 #  SAFE SENDING (handles blocked users and rate limits)
 # ======================================================================
 async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML", reply_markup=None) -> str:
+    """Returns 'ok', 'blocked' or 'failed'. Users who blocked the bot are marked inactive."""
     for _ in range(2):
         try:
             await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -1630,13 +1606,13 @@ async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML",
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
         except TelegramForbiddenError:
-            await asyncio.to_thread(mark_inactive, user_id)
+            mark_inactive(user_id)
             STATS["blocked"] += 1
             return "blocked"
         except TelegramBadRequest as e:
             message_text = str(e).lower()
             if "chat not found" in message_text or "deactivated" in message_text:
-                await asyncio.to_thread(mark_inactive, user_id)
+                mark_inactive(user_id)
                 STATS["blocked"] += 1
                 return "blocked"
             logging.error(f"Bad request for user {user_id}: {e}")
@@ -1652,45 +1628,45 @@ async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML",
 
 async def broadcast_message(bot: Bot, text: str, flag: str | None = None, class_id: str | None = None) -> dict:
     result = {"ok": 0, "blocked": 0, "failed": 0}
-    recipients = await asyncio.to_thread(get_recipients, flag, class_id)
-    for u_id in recipients:
+    for u_id in get_recipients(flag, class_id):
         status = await safe_send(bot, u_id, text)
         result[status] += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # stay under Telegram rate limits
     return result
 
 
 async def broadcast_to(bot: Bot, text: str, audience: str, flag: str | None = "announcements") -> dict:
+    """Admin broadcasts: audience = 'all' | 'students' | 'teachers' | a class id."""
     result = {"ok": 0, "blocked": 0, "failed": 0}
-    recipients = await asyncio.to_thread(get_audience_recipients, audience, flag)
-    for u_id in recipients:
+    for u_id in get_audience_recipients(audience, flag):
         status = await safe_send(bot, u_id, text)
         result[status] += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # stay under Telegram rate limits
     return result
 
 
 # ======================================================================
-#  SCHEDULER JOBS
+#  SCHEDULER JOBS  (main.py registers them; one set per class / teacher)
 # ======================================================================
 async def send_morning_alert(bot: Bot, class_id: str):
     today = datetime.now(UZB_TZ).date()
     if today.weekday() not in class_timetable(class_id):
         return
 
-    off_reason = await asyncio.to_thread(get_off_reason, class_id, today)
-    sched_text = await asyncio.to_thread(format_date_schedule, class_id, today)
-    if off_reason is not None:
-        msg = "☀️ <b>Xayrli kun!</b>\n\n" + sched_text
+    if get_off_reason(class_id, today) is not None:
+        msg = "☀️ <b>Xayrli kun!</b>\n\n" + format_date_schedule(class_id, today)
     else:
-        msg = "☀️ <b>Xayrli kun! Darslar boshlanishiga 1 soat qoldi.</b>\n\n" + sched_text
+        msg = (
+            "☀️ <b>Xayrli kun! Darslar boshlanishiga 1 soat qoldi.</b>\n\n"
+            + format_date_schedule(class_id, today)
+        )
     await broadcast_message(bot, msg, flag="morning_alert", class_id=class_id)
 
 
 async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
     today = datetime.now(UZB_TZ).date()
     bells = class_bells(class_id)
-    lessons = await asyncio.to_thread(effective_lessons, class_id, today)
+    lessons = effective_lessons(class_id, today)
     idx = lesson_num - 1
 
     if idx >= len(lessons):
@@ -1710,8 +1686,7 @@ async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
             f"{room_line}"
             f"👨‍🏫 <b>O'qituvchi:</b> {esc(next_lesson['teachers'])}"
         )
-        notes = await asyncio.to_thread(get_notes, class_id, today)
-        note = notes.get(next_bell["lesson"])
+        note = get_notes(class_id, today).get(next_bell["lesson"])
         if note:
             msg += f"\n⚠️ <b>{esc(note)}</b>"
     else:
@@ -1724,28 +1699,27 @@ async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
 
 
 async def send_teacher_morning(bot: Bot, teacher_key: str):
+    """08:00 warning for a teacher: which classes he teaches today (or that he is free)."""
     now = datetime.now(UZB_TZ)
     cfg = TEACHERS[teacher_key]
     if now.weekday() == 5 and not cfg["timetable"].get(5):
-        return
-    day_text = await asyncio.to_thread(format_teacher_day, teacher_key, now.date())
-    text = f"☀️ <b>Xayrli tong, {esc(cfg['short'])} ustoz!</b>\n\n" + day_text
-    t_lessons = await asyncio.to_thread(teacher_lessons, teacher_key, now.date())
-    if not t_lessons:
-        nxt_text = await asyncio.to_thread(teacher_next_text, teacher_key, now)
-        text += "\n\n" + nxt_text
+        return  # this teacher does not teach on Saturdays: no message
+    text = f"☀️ <b>Xayrli tong, {esc(cfg['short'])} ustoz!</b>\n\n" + format_teacher_day(teacher_key, now.date())
+    if not teacher_lessons(teacher_key, now.date()):
+        text += "\n\n" + teacher_next_text(teacher_key, now)
 
-    recipients = await asyncio.to_thread(get_teacher_recipients, teacher_key, "morning_alert")
-    for user_id in recipients:
+    for user_id in get_teacher_recipients(teacher_key, "morning_alert"):
         await safe_send(bot, user_id, text)
         await asyncio.sleep(0.05)
 
 
 async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: int):
+    """Sent a few minutes BEFORE every lesson of a teacher: which class he is going to teach.
+    For back-to-back lessons it arrives right when the previous lesson ends."""
     today = datetime.now(UZB_TZ).date()
-    lessons = await asyncio.to_thread(teacher_lessons, teacher_key, today)
+    lessons = teacher_lessons(teacher_key, today)
     item = next((l for l in lessons if l["lesson"] == lesson_num), None)
-    if item is None:
+    if item is None:          # no lesson in this slot today (or it was cancelled)
         return
 
     cfg = TEACHERS[teacher_key]
@@ -1764,12 +1738,10 @@ async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: i
     if previous and previous["class"] == item["class"]:
         text += "\n🔁 Oldingi dars bilan bir xil sinf"
     if item.get("class_id"):
-        notes = await asyncio.to_thread(get_notes, item["class_id"], today)
-        note = notes.get(lesson_num)
+        note = get_notes(item["class_id"], today).get(lesson_num)
         if note:
             text += f"\n⚠️ <b>{esc(note)}</b>"
 
-    recipients = await asyncio.to_thread(get_teacher_recipients, teacher_key, "lesson_alerts")
-    for user_id in recipients:
+    for user_id in get_teacher_recipients(teacher_key, "lesson_alerts"):
         await safe_send(bot, user_id, text)
         await asyncio.sleep(0.05)
