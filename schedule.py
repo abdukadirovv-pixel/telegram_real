@@ -2,7 +2,7 @@
 schedule.py  -  the "brain" of the bot (no Telegram handlers here)
 
   * configuration (token, owner, timezone)
-  * database + users
+  * database + users (Supabase PostgreSQL)
   * class timetables (10-A, 10-B) and teacher timetables (Umarbek)
   * schedule logic: what lesson is now / next / how much time is left
   * ready-made message texts
@@ -12,14 +12,15 @@ command.py  imports this file and holds all commands / buttons.
 main.py     imports both and starts the bot.
 """
 import os
+import re
 import html
 import math
 import asyncio
 import logging
-import sqlite3
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 
+import psycopg2
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
@@ -45,11 +46,125 @@ UZB_TZ = ZoneInfo("Asia/Tashkent")
 # (Send any sticker to the bot as the owner and it replies with its file_id.)
 FUNNY_STICKER_ID = os.getenv("FUNNY_STICKER_ID", "").strip()
 
-# Ensure the data directory exists
-os.makedirs("data", exist_ok=True)
+# Supabase PostgreSQL Connection URL (reads DATABASE_URL from env, falls back to your link)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres.dyjfjwjgizoxjtdcrtna:sanchez1234567891234567789@aws-1-eu-central-1.pooler.supabase.com:6543/postgres",
+)
 
-# Save SQLite database inside the persistent volume folder
-conn = sqlite3.connect("data/subscribers.db", check_same_thread=False)
+
+# ======================================================================
+#  SUPABASE POSTGRESQL ADAPTER (keeps 100% compatibility with command.py)
+# ======================================================================
+def _translate_sql(query: str) -> str:
+    """Translates SQLite syntax used in schedule.py and command.py into PostgreSQL syntax."""
+    q = query.strip()
+
+    # Replace SQLite '?' placeholders with PostgreSQL '%s'
+    q = q.replace("?", "%s")
+
+    # Replace SQLite 'COLLATE NOCASE' with PostgreSQL-compatible LOWER()
+    q = re.sub(r"(\w+)\s+COLLATE\s+NOCASE", r"LOWER(\1)", q, flags=re.IGNORECASE)
+
+    # Translate INSERT OR IGNORE INTO -> INSERT INTO ... ON CONFLICT DO NOTHING
+    if re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", q, flags=re.IGNORECASE):
+        q = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", q, flags=re.IGNORECASE)
+        q = q.rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    # Translate INSERT OR REPLACE INTO for each table's primary key
+    if re.match(r"^INSERT\s+OR\s+REPLACE\s+INTO", q, flags=re.IGNORECASE):
+        q = re.sub(r"^INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", q, flags=re.IGNORECASE).rstrip(";")
+        low = q.lower()
+        if "into bot_settings" in low:
+            q += " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+        elif "into class_overrides" in low:
+            q += (
+                " ON CONFLICT (class_id, day_date, lesson) DO UPDATE SET "
+                "kind = EXCLUDED.kind, note = EXCLUDED.note"
+            )
+        elif "into class_timetable" in low:
+            q += (
+                " ON CONFLICT (class_id, day, pos) DO UPDATE SET "
+                "subject = EXCLUDED.subject, room = EXCLUDED.room, teachers = EXCLUDED.teachers"
+            )
+        elif "into teacher_timetable" in low:
+            q += (
+                " ON CONFLICT (teacher_key, day, lesson) DO UPDATE SET "
+                "class_label = EXCLUDED.class_label, class_id = EXCLUDED.class_id, "
+                "subject = EXCLUDED.subject, room = EXCLUDED.room"
+            )
+
+    return q
+
+
+class SupabaseConnection:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self._conn = None
+        self.connect()
+
+    def connect(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = psycopg2.connect(self.dsn)
+        self._conn.autocommit = True
+
+    def cursor(self):
+        return SupabaseCursor(self)
+
+    def commit(self):
+        try:
+            if self._conn and not self._conn.closed:
+                self._conn.commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            self.connect()
+
+
+class SupabaseCursor:
+    def __init__(self, db: SupabaseConnection):
+        self.db = db
+        self._cur = db._conn.cursor()
+
+    def _reset_cursor(self):
+        self.db.connect()
+        self._cur = self.db._conn.cursor()
+
+    def execute(self, query: str, params=None):
+        sql = _translate_sql(query)
+        for attempt in range(2):
+            try:
+                if self.db._conn is None or self.db._conn.closed:
+                    self._reset_cursor()
+                if params is not None:
+                    return self._cur.execute(sql, tuple(params))
+                return self._cur.execute(sql)
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                if attempt == 0:
+                    self._reset_cursor()
+                else:
+                    raise
+            except Exception:
+                try:
+                    self.db._conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    @property
+    def rowcount(self) -> int:
+        return self._cur.rowcount
+
+
+conn = SupabaseConnection(DATABASE_URL)
 cursor = conn.cursor()
 
 # ======================================================================
@@ -57,7 +172,7 @@ cursor = conn.cursor()
 # ======================================================================
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         username TEXT,
         first_name TEXT,
         role TEXT DEFAULT 'user'
@@ -67,10 +182,8 @@ cursor.execute("""
 
 def ensure_column(table: str, column: str, ddl: str):
     """Adds a column to an existing table if it is missing (safe migration)."""
-    cursor.execute(f"PRAGMA table_info({table})")
-    existing = [row[1] for row in cursor.fetchall()]
-    if column not in existing:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}")
+    conn.commit()
 
 
 ensure_column("users", "is_active", "INTEGER DEFAULT 1")
@@ -243,8 +356,6 @@ DEFAULT_TIMETABLE_10B = {
 }
 
 # --- 10-A aniq ---
-# Same bell times as 10-B for lessons 1-7. Monday has an 8th lesson, so it gets one
-# extra slot right after the 7th (5-minute break, 45-minute lesson, like the rest).
 BELLS_10A = [dict(b) for b in BELLS_10B] + [
     {"lesson": 8, "start": "15:15", "end": "16:00"},
 ]
@@ -295,7 +406,6 @@ DEFAULT_TIMETABLE_10A = {
 }
 
 # --- 10-E umumta'lim ---
-# The printout starts at 8:30, but the bot uses the SAME bell times as the other classes (start 09:00).
 BELLS_10E = [dict(b) for b in BELLS_10B]
 
 DEFAULT_TIMETABLE_10E = {
@@ -346,8 +456,6 @@ DEFAULT_TIMETABLE_10E = {
 }
 
 # --- 10-01 and 10-02 ---
-# The printouts already use the same bell times as the other classes (09:00 - 15:10, 7 lessons).
-# There are no rooms in these two timetables: room = "" (the bot then simply does not show a room).
 BELLS_1001 = [dict(b) for b in BELLS_10B]
 BELLS_1002 = [dict(b) for b in BELLS_10B]
 
@@ -475,7 +583,7 @@ CLASSES = {
         "bells": BELLS_10E,
         "default": DEFAULT_TIMETABLE_10E,
     },
-    "1001": {                      # typed as 10-01 or 1001 (hyphens are ignored)
+    "1001": {
         "name": "10-01",
         "short": "10-01",
         "morning": "08:00",
@@ -493,15 +601,12 @@ CLASSES = {
 
 # ======================================================================
 #  TEACHERS  (add a new teacher = add one block here)
-#  Teacher lessons use the SAME bell times as the classes.
 # ======================================================================
 TEACHER_BELLS = [dict(b) for b in BELLS_10A]  # 8 slots
 
 
 def _tl(lesson: int, klass: str, class_id: str | None = None, subject: str = "Informatika",
         room: str | None = None) -> dict:
-    """One teacher lesson. class_id is set only for classes that exist in the bot (10a / 10b / 10e)
-    so a holiday of that class also cancels the lesson for the teacher."""
     return {"lesson": lesson, "class": klass, "class_id": class_id, "subject": subject, "room": room}
 
 
@@ -541,6 +646,7 @@ TIMETABLE_UMARBEK = {
         _tl(2, "10-D umumta'lim"),
     ],
 }
+
 
 # Saidova O'g'iljon (physics) - lessons with rooms
 def _ph(lesson: int, klass: str, room: str, class_id: str | None = None) -> dict:
@@ -589,8 +695,7 @@ TIMETABLE_OGILJON = {
 }
 
 
-# Olloyorov Muhammadsodiq (maths): "Matematika" in grades 1-6, from grade 7 it is split into
-# "Algebra" and "Geometriya". Every lesson is in room 217.
+# Olloyorov Muhammadsodiq (maths)
 def _math(lesson: int, klass: str, subject: str, class_id: str | None = None) -> dict:
     return _tl(lesson, klass, class_id, subject, "217")
 
@@ -634,9 +739,9 @@ TEACHERS = {
         "short": "Umarbek",
         "subject": "Informatika",
         "morning": "08:00",
-        "remind_before": 5,             # minutes before EVERY lesson: "you are going to teach class X"
-        "default": TIMETABLE_UMARBEK,   # copied into the database on the first run only
-        "timetable": {},                # live timetable, loaded from the database
+        "remind_before": 5,
+        "default": TIMETABLE_UMARBEK,
+        "timetable": {},
     },
     "ogiljon": {
         "name": "Saidova O'g'iljon",
@@ -644,7 +749,7 @@ TEACHERS = {
         "subject": "Fizika",
         "morning": "08:00",
         "remind_before": 5,
-        "aliases": ["o'g'lijon"],       # other spelling of the name
+        "aliases": ["o'g'lijon"],
         "default": TIMETABLE_OGILJON,
         "timetable": {},
     },
@@ -652,7 +757,7 @@ TEACHERS = {
         "name": "Olloyorov Muhammadsodiq",
         "short": "Muhammadsodiq",
         "subject": "Matematika",
-        "always_show_subject": True,    # he teaches Matematika / Algebra / Geometriya: always show which one
+        "always_show_subject": True,
         "morning": "08:00",
         "remind_before": 5,
         "aliases": ["sodiq"],
@@ -664,12 +769,14 @@ TEACHERS = {
 # ======================================================================
 #  CLASS TIMETABLES: migration, seeding, loading
 # ======================================================================
-# Live timetables used by the whole bot: TIMETABLES[class_id][weekday] -> list of lessons
 TIMETABLES: dict[str, dict[int, list[dict]]] = {}
 
 
 def table_exists(name: str) -> bool:
-    cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
+    cursor.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ?",
+        (name,),
+    )
     return cursor.fetchone() is not None
 
 
@@ -789,8 +896,6 @@ def class_token(raw: str | None) -> str | None:
 
 
 def class_id_from_label(label: str) -> str | None:
-    """'10-B aniq' / '10b' -> '10b' when it is a class of the bot (so that class holidays also
-    cancel the teacher's lesson), otherwise None (e.g. '9-A aniq')."""
     words = label.split()
     return class_token(words[0]) if words else None
 
@@ -822,10 +927,10 @@ def register_or_update_user(user_id: int, username: str, first_name: str):
         INSERT INTO users (user_id, username, first_name, role)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
+            username=EXCLUDED.username,
+            first_name=EXCLUDED.first_name,
             is_active=1,
-            role=CASE WHEN user_id = ? THEN 'owner' ELSE users.role END
+            role=CASE WHEN users.user_id = ? THEN 'owner' ELSE users.role END
     """, (user_id, username or "NoUsername", first_name or "User", role, OWNER_ID))
     conn.commit()
 
@@ -885,8 +990,6 @@ def set_class_admin(user_id: int, class_id: str):
 
 
 def can_manage_user(admin_id: int, target_id: int) -> bool:
-    """Owner and global admins may manage anybody. A class admin only the students of his own class
-    (never admins, the owner or teachers)."""
     admin_class = get_admin_class(admin_id)
     if admin_class is None:
         return is_admin_or_owner(admin_id)
@@ -989,11 +1092,6 @@ def set_inbox(user_id: int, value: bool):
 
 
 def get_inbox_recipients(sender_id: int) -> list[int]:
-    """Who gets a message that 'sender_id' wrote to the bot (only those with /inbox on).
-      * the owner always gets everything (if his inbox is on)
-      * main admins get the messages of all students
-      * a class admin gets only the messages of the students of HIS class
-      * messages of admins and of teachers go to the owner only (teacher mode stays hidden)"""
     sender_id = int(sender_id)
     if sender_id == OWNER_ID:
         return []
@@ -1012,10 +1110,10 @@ def get_inbox_recipients(sender_id: int) -> list[int]:
         for admin_id, admin_class in cursor.fetchall():
             if admin_id == sender_id:
                 continue
-            if admin_class in CLASSES:          # class admin: only his own class
+            if admin_class in CLASSES:
                 if class_id == admin_class:
                     recipients.add(admin_id)
-            else:                               # main admin: everybody
+            else:
                 recipients.add(admin_id)
 
     recipients.discard(sender_id)
@@ -1037,7 +1135,6 @@ migrate_inbox_setting()
 
 # --- recipients ---
 def get_recipients(flag: str | None = None, class_id: str | None = None) -> list[int]:
-    """Active, non-banned users. Optionally only one class / only those with a setting switched on."""
     query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
     params: list = []
     if flag in SETTING_LABELS:
@@ -1058,8 +1155,6 @@ def get_teacher_recipients(teacher_key: str, flag: str | None = None) -> list[in
 
 
 def get_audience_recipients(audience: str, flag: str | None = "announcements") -> list[int]:
-    """Who gets a broadcast.
-    audience = 'all' (everybody) | 'students' (everybody except teachers) | 'teachers' | a class id ('10a')."""
     query = "SELECT user_id FROM users WHERE is_active = 1 AND banned = 0"
     params: list = []
     if audience == "students":
@@ -1078,8 +1173,6 @@ def get_audience_recipients(audience: str, flag: str | None = "announcements") -
 
 
 def users_scope_where(scope: str, include_teachers: bool):
-    """SQL filter of a /users window. scope = a class id | 'none' | 'teachers' | 'all'.
-    Teachers are only visible when include_teachers is True (= the viewer is the owner)."""
     if scope == "teachers":
         return ("teacher_key IS NOT NULL", []) if include_teachers else None
     if scope == "none":
@@ -1137,7 +1230,6 @@ def subscribe_if_stopped(user_id: int):
 #  DATE / OVERRIDE HELPERS
 # ======================================================================
 def parse_date(raw: str | None) -> date | None:
-    """Accepts YYYY-MM-DD, 'bugun' / 'today', 'ertaga' / 'tomorrow'."""
     if not raw:
         return None
     raw = raw.strip().lower()
@@ -1153,20 +1245,16 @@ def parse_date(raw: str | None) -> date | None:
 
 
 def week_start(today: date) -> date:
-    """Monday of this week (on Saturday/Sunday: Monday of the coming week)."""
     wd = today.weekday()
     return today - timedelta(days=wd) if wd < 5 else today + timedelta(days=7 - wd)
 
 
 def teacher_week_start(today: date) -> date:
-    """Monday of this week (on Sunday: Monday of the coming week). Saturday still counts."""
     wd = today.weekday()
     return today - timedelta(days=wd) if wd < 6 else today + timedelta(days=1)
 
 
 def class_week_start(class_id: str, today: date) -> date:
-    """Monday of the week to show for a class. Sunday always shows the coming week; Saturday does too,
-    unless the class has Saturday lessons (then the current week is still in progress)."""
     wd = today.weekday()
     has_saturday = 5 in class_timetable(class_id)
     if wd == 6 or (wd == 5 and not has_saturday):
@@ -1175,7 +1263,6 @@ def class_week_start(class_id: str, today: date) -> date:
 
 
 def get_off_reason(class_id: str, d: date) -> str | None:
-    """Returns the reason if the day is marked 'no school' for this class, otherwise None."""
     cursor.execute(
         "SELECT note FROM class_overrides WHERE class_id = ? AND day_date = ? AND lesson = 0 AND kind = 'off'",
         (class_id, d.isoformat()),
@@ -1193,7 +1280,6 @@ def get_notes(class_id: str, d: date) -> dict[int, str]:
 
 
 def school_off(d: date) -> bool:
-    """True when EVERY class of the bot has a holiday on that date (= school-wide holiday)."""
     return all(get_off_reason(cid, d) is not None for cid in CLASSES)
 
 
@@ -1222,7 +1308,6 @@ def day_label(d: date, today: date) -> str:
 #  CLASS SCHEDULE: lessons, texts
 # ======================================================================
 def effective_lessons(class_id: str, d: date) -> list[dict]:
-    """Lessons that really take place for a class on a date (none on weekends/holidays)."""
     timetable = class_timetable(class_id)
     wd = d.weekday()
     if wd not in timetable or get_off_reason(class_id, d) is not None:
@@ -1285,7 +1370,6 @@ def format_week(class_id: str, start: date) -> str:
     return text
 
 
-# --- now / next / time left (students) ---
 NO_LESSONS_LEFT_TEXT = "🏁 <b>Bugun uchun darslar qolmadi.</b>"
 JOKE_TEXT = "Shu malli ham adam o'qimi eee 😄"
 
@@ -1303,7 +1387,6 @@ def find_current(class_id: str, now: datetime):
 
 
 def find_next(class_id: str, now: datetime, days: int = 8):
-    """Next lesson that starts after 'now'. days=1 means: today only."""
     bells = class_bells(class_id)
     for offset in range(0, days):
         d = now.date() + timedelta(days=offset)
@@ -1342,15 +1425,13 @@ def next_lesson_text(class_id: str, now: datetime) -> str:
 
 
 def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
-    """Text for /now. The bool is True when no lessons are left today (the bot then also
-    sends the funny sticker)."""
     bells = class_bells(class_id)
     lessons = effective_lessons(class_id, now.date())
     if not lessons:
         return "🎉 <b>Bugun dars yo'q.</b>\nKeyingi dars: /next", False
 
     current = find_current(class_id, now)
-    upcoming = find_next(class_id, now, days=1)  # today only
+    upcoming = find_next(class_id, now, days=1)
 
     if current:
         idx, item, end = current
@@ -1378,7 +1459,6 @@ def class_now_text(class_id: str, now: datetime) -> tuple[str, bool]:
 
 
 def class_time_left_text(class_id: str, now: datetime) -> str:
-    """Text for the 'how much time left' button."""
     bells = class_bells(class_id)
     lessons = effective_lessons(class_id, now.date())
     if not lessons:
@@ -1415,8 +1495,6 @@ def teacher_bell(lesson_num: int) -> dict:
 
 
 def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
-    """Lessons the teacher really has on a date. Lessons are cancelled when that class
-    has a holiday, and everything is cancelled on a school-wide holiday."""
     lessons = TEACHERS[teacher_key]["timetable"].get(d.weekday(), [])
     if not lessons or school_off(d):
         return []
@@ -1430,8 +1508,6 @@ def teacher_lessons(teacher_key: str, d: date) -> list[dict]:
 
 
 def _subject_shown(teacher_key: str, item: dict) -> bool:
-    """Show the subject of a teacher lesson? Always for teachers with several subjects
-    (Matematika / Algebra / Geometriya), otherwise only when it differs from the main subject."""
     cfg = TEACHERS[teacher_key]
     return bool(cfg.get("always_show_subject")) or item["subject"] != cfg["subject"]
 
@@ -1492,7 +1568,6 @@ def format_teacher_week(teacher_key: str, start: date) -> str:
 
 
 def format_teacher_timetable(teacher_key: str) -> str:
-    """The saved weekly timetable of a teacher, exactly as stored (no holidays applied)."""
     cfg = TEACHERS[teacher_key]
     text = f"🗓 <b>{esc(cfg['name'])}</b> — dars jadvali\n\n"
     for wd in range(6):
@@ -1562,8 +1637,6 @@ def teacher_next_text(teacher_key: str, now: datetime) -> str:
 
 
 def teacher_now_text(teacher_key: str, now: datetime) -> str:
-    """Current lesson of the teacher: the class if he has a lesson, otherwise
-    'sizda hozir dars yo'q - bekorsiz' and the time of the next lesson under it."""
     current = find_teacher_current(teacher_key, now)
     if current:
         item, end = current
@@ -1583,7 +1656,7 @@ def teacher_now_text(teacher_key: str, now: datetime) -> str:
             note = get_notes(item["class_id"], now.date()).get(item["lesson"])
             if note:
                 text += f"\n⚠️ <b>{esc(note)}</b>"
-        upcoming = find_teacher_next(teacher_key, now, days=1)  # today only
+        upcoming = find_teacher_next(teacher_key, now, days=1)
         if upcoming:
             text += "\n\n" + _teacher_next_block(teacher_key, upcoming, now)
         else:
@@ -1597,7 +1670,6 @@ def teacher_now_text(teacher_key: str, now: datetime) -> str:
 #  SAFE SENDING (handles blocked users and rate limits)
 # ======================================================================
 async def safe_send(bot: Bot, user_id: int, text: str, parse_mode: str = "HTML", reply_markup=None) -> str:
-    """Returns 'ok', 'blocked' or 'failed'. Users who blocked the bot are marked inactive."""
     for _ in range(2):
         try:
             await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -1631,17 +1703,16 @@ async def broadcast_message(bot: Bot, text: str, flag: str | None = None, class_
     for u_id in get_recipients(flag, class_id):
         status = await safe_send(bot, u_id, text)
         result[status] += 1
-        await asyncio.sleep(0.05)  # stay under Telegram rate limits
+        await asyncio.sleep(0.05)
     return result
 
 
 async def broadcast_to(bot: Bot, text: str, audience: str, flag: str | None = "announcements") -> dict:
-    """Admin broadcasts: audience = 'all' | 'students' | 'teachers' | a class id."""
     result = {"ok": 0, "blocked": 0, "failed": 0}
     for u_id in get_audience_recipients(audience, flag):
         status = await safe_send(bot, u_id, text)
         result[status] += 1
-        await asyncio.sleep(0.05)  # stay under Telegram rate limits
+        await asyncio.sleep(0.05)
     return result
 
 
@@ -1699,11 +1770,10 @@ async def send_lesson_end_alert(bot: Bot, class_id: str, lesson_num: int):
 
 
 async def send_teacher_morning(bot: Bot, teacher_key: str):
-    """08:00 warning for a teacher: which classes he teaches today (or that he is free)."""
     now = datetime.now(UZB_TZ)
     cfg = TEACHERS[teacher_key]
     if now.weekday() == 5 and not cfg["timetable"].get(5):
-        return  # this teacher does not teach on Saturdays: no message
+        return
     text = f"☀️ <b>Xayrli tong, {esc(cfg['short'])} ustoz!</b>\n\n" + format_teacher_day(teacher_key, now.date())
     if not teacher_lessons(teacher_key, now.date()):
         text += "\n\n" + teacher_next_text(teacher_key, now)
@@ -1714,12 +1784,10 @@ async def send_teacher_morning(bot: Bot, teacher_key: str):
 
 
 async def send_teacher_lesson_reminder(bot: Bot, teacher_key: str, lesson_num: int):
-    """Sent a few minutes BEFORE every lesson of a teacher: which class he is going to teach.
-    For back-to-back lessons it arrives right when the previous lesson ends."""
     today = datetime.now(UZB_TZ).date()
     lessons = teacher_lessons(teacher_key, today)
     item = next((l for l in lessons if l["lesson"] == lesson_num), None)
-    if item is None:          # no lesson in this slot today (or it was cancelled)
+    if item is None:
         return
 
     cfg = TEACHERS[teacher_key]
