@@ -53,8 +53,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     )
 
     for class_id, cfg in CLASSES.items():
-        # 1. Morning schedule alert (Mon-Sat; on days without lessons the job simply does nothing,
-        #    so classes with Saturday lessons like 10-E work without extra settings)
+        # 1. Morning schedule alert (Mon-Sat)
         m_hour, m_minute = map(int, cfg["morning"].split(":"))
         scheduler.add_job(
             send_morning_alert, "cron", day_of_week="mon-sat",
@@ -69,7 +68,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
                 hour=e_hour, minute=e_minute, args=[bot, class_id, bell["lesson"]],
             )
 
-    # 3. Teachers (Mon-Sat, teachers also work on Saturday)
+    # 3. Teachers (Mon-Sat)
     for teacher_key, cfg in TEACHERS.items():
         # 3a. morning message with all lessons of the day
         t_hour, t_minute = map(int, cfg["morning"].split(":"))
@@ -78,8 +77,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
             hour=t_hour, minute=t_minute, args=[bot, teacher_key],
         )
 
-        # 3b. a reminder a few minutes BEFORE every lesson slot: "you are going to teach class X".
-        #     Slots where the teacher has no lesson are skipped inside the job itself.
+        # 3b. a reminder a few minutes BEFORE every lesson slot
         lead = cfg.get("remind_before", 5)
         for bell in TEACHER_BELLS:
             remind_at = datetime.strptime(bell["start"], "%H:%M") - timedelta(minutes=lead)
@@ -120,22 +118,10 @@ async def main():
     # 1. Start the health server IMMEDIATELY so Render detects the port right away
     runner = await start_health_server()
 
-    # --- SUPABASE DATABASE POOL INITIALIZATION ---
-    db_pool = None
-    try:
-        db_pool = await schedule.init_db_pool()
-        await schedule.setup_database(db_pool)
-        await schedule.initialize_all_schedules()
-        logging.info("Connected to Supabase PostgreSQL and initialized schedules successfully!")
-    except Exception as e:
-        logging.error(f"Failed to connect to the database: {e}")
+    logging.info("Connected to Supabase PostgreSQL and initialized schedules successfully via schedule.py!")
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
-
-    # Store db_pool in dispatcher data so handlers can access it easily via event workflow data
-    if db_pool:
-        dp["db_pool"] = db_pool
 
     dp.message.outer_middleware(BanMiddleware())
     dp.callback_query.outer_middleware(BanMiddleware())
@@ -148,9 +134,6 @@ async def main():
         await dp.start_polling(bot)
     finally:
         # --- CLEANUP ---
-        if db_pool:
-            await db_pool.close()
-            logging.info("Database connection pool closed.")
         if runner:
             await runner.cleanup()
 
