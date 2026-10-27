@@ -47,10 +47,7 @@ UZB_TZ = ZoneInfo("Asia/Tashkent")
 FUNNY_STICKER_ID = os.getenv("FUNNY_STICKER_ID", "").strip()
 
 # Supabase PostgreSQL Connection URL (reads DATABASE_URL from env, falls back to your link)
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres.dyjfjwjgizoxjtdcrtna:sanchez1234567891234567789@aws-1-eu-central-1.pooler.supabase.com:6543/postgres",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 # ======================================================================
