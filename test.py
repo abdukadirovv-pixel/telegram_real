@@ -1,6 +1,7 @@
 """
 test.py - BSB va CHSB javoblarini test-uz.ru saytidan olish moduli
-O'quv yillari (2026-2027, 2025-2026) bo'yicha ajratish va skrinshot javoblarni tartib bilan ko'rsatish
+O'quv yillari (2026-2027, 2025-2026) bo'yicha ajratish,
+1-savol shartini (matn/rasm) ko'rsatish va skrinshot javoblarni tartib bilan yetkazish.
 """
 import re
 import html
@@ -161,15 +162,42 @@ def get_controls_by_year_sync(kind: str, cat_id: str) -> dict[str, list[dict]]:
 
 
 def _fetch_single_question(kind: str, q_id: str, label: str) -> dict:
-    """Bitta savol sahifasidagi yechim yoki javobni tahlil qiladi."""
+    """Bitta savol sahifasidagi shart (savol matni/rasmi) va javob/yechimni tahlil qiladi."""
     page = "sor_uz.php" if kind == "bsb" else "soch_uz.php"
     url = f"{BASE_URL}/{page}?id={q_id}"
     q_page = _fetch_html(url)
 
     ans_text = None
     sol_imgs = []
+    q_text = None
+    q_imgs = []
 
     if q_page:
+        # A. Savol shartini (Question) ajratib olish
+        q_block = re.search(
+            r"<h2>Question</h2>(.*?)(?:<h2>|<h2>Solution</h2>|<h2>Answer</h2>|<footer)",
+            q_page,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if q_block:
+            block_html = q_block.group(1).strip()
+            # Savol sharti rasmlari
+            for img in re.findall(r'<img[^>]*src=["\']([^"\']+)["\']', block_html, re.IGNORECASE):
+                if not any(x in img for x in ["search", "telegram", "yandex", "logo", "organish", "sol"]):
+                    full_url = urljoin(BASE_URL, img)
+                    if full_url not in q_imgs:
+                        q_imgs.append(full_url)
+
+            # Savol sharti matni
+            cleaned_html = re.sub(r"<script.*?</script>", "", block_html, flags=re.DOTALL | re.IGNORECASE)
+            cleaned_html = re.sub(r"<style.*?</style>", "", cleaned_html, flags=re.DOTALL | re.IGNORECASE)
+            cleaned_html = re.sub(r"\(window\.adsbygoogle.*?\);", "", cleaned_html, flags=re.DOTALL | re.IGNORECASE)
+            clean_text = re.sub(r"<[^<]+?>", " ", cleaned_html)
+            clean_text = html.unescape(" ".join(clean_text.split()))
+            if clean_text and len(clean_text) >= 3 and "window.adsbygoogle" not in clean_text:
+                q_text = clean_text
+
+        # B. Javob / Yechimni (Answer/Solution) ajratib olish
         # 1. Test varianti javobi (Masalan: <h2>Answer</h2><p>C</p>)
         ans_m = re.search(r"<h2>Answer</h2>\s*<p>(.*?)</p>", q_page, re.IGNORECASE | re.DOTALL)
         if ans_m:
@@ -206,6 +234,8 @@ def _fetch_single_question(kind: str, q_id: str, label: str) -> dict:
     return {
         "id": q_id,
         "label": label,
+        "q_text": q_text,
+        "q_images": q_imgs,
         "text": ans_text,
         "images": sol_imgs,
         "has_answer": is_answered,
@@ -359,6 +389,17 @@ def kb_answers_menu(kind: str, grade: int, cat_id: str, ctrl_id: str, questions:
     """Javoblar va skrinshotlarni tartib bilan ko'rish klaviaturasi."""
     rows = []
 
+    # 1. TESTNI TEKSHIRISH UCHUN 1-SAVOL SHARTINI KO'RISH TUGMASI
+    q1 = questions[0] if questions else None
+    if q1 and (q1.get("q_images") or q1.get("q_text")):
+        rows.append([
+            InlineKeyboardButton(
+                text="🔍 1-savol shartini ko'rish (Testni tekshirish) 🖼",
+                callback_data=f"ans:qcond:{kind}:{ctrl_id}",
+            )
+        ])
+
+    # 2. Agar savollar yozma/skrinshot bo'lsa, har bir savol uchun yechim tugmasi
     image_questions = [q for q in questions if q["images"]]
     if image_questions:
         q_buttons = []
@@ -376,9 +417,10 @@ def kb_answers_menu(kind: str, grade: int, cat_id: str, ctrl_id: str, questions:
         for j in range(0, len(q_buttons), 3):
             rows.append(q_buttons[j:j + 3])
 
+        # Barcha yechim rasmlarini albom qilib yuklash
         rows.append([
             InlineKeyboardButton(
-                text="📥 Barcha rasmlarni albomda yuklash",
+                text="📥 Barcha yechimlarni albomda yuklash",
                 callback_data=f"ans:all:{kind}:{ctrl_id}",
             )
         ])
@@ -581,10 +623,21 @@ async def cb_ans_control(call: types.CallbackQuery):
 
     ctrl_name = ans_data.get("title") or f"{grade}-sinf {title_kind}"
     msg_lines = [
-        f"✅ <b>{html.escape(ctrl_name)} javoblari</b>\n",
+        f"✅ <b>{html.escape(ctrl_name)} javoblari</b>",
         f"📊 Jami {len(questions)} ta topshiriqdan {answered_count} tasining javobi mavjud.\n",
     ]
 
+    # --- 1-SAVOL SHARTINI KO'RSATISH (TESTNI SOLISHTIRIB ISHONCH HOSIL QILISH UCHUN) ---
+    q1 = questions[0]
+    if q1.get("q_text"):
+        preview_text = q1["q_text"]
+        if len(preview_text) > 180:
+            preview_text = preview_text[:177] + "..."
+        msg_lines.append(f"🔍 <b>1-savol sharti (Testni tekshirish uchun):</b>\n<i>«{html.escape(preview_text)}»</i>\n")
+    elif q1.get("q_images"):
+        msg_lines.append("🔍 <b>1-savol sharti:</b> Rasm shaklida berilgan. Qo'lingizdagi test bilan solishtirish uchun quyidagi tugmani bosing.\n")
+
+    # --- JAVOBLAR RO'YXATI ---
     if all(q["text"] and len(q["text"]) <= 4 for q in questions if q["has_answer"]) and not has_images:
         cols = []
         for q in questions:
@@ -595,7 +648,7 @@ async def cb_ans_control(call: types.CallbackQuery):
     elif has_images:
         msg_lines.append(
             "📌 <b>Ushbu test yozma topshiriqlardan iborat bo'lib, javoblari skrinshot (rasm) shaklida.</b>\n"
-            "Savol javobini ko'rish uchun quyidagi tugmalardan foydalaning yoki barchasini tartib bilan yuklab oling:"
+            "Har bir savol yechimini ko'rish uchun quyidagi tugmalardan foydalaning:"
         )
     else:
         for q in questions[:15]:
@@ -614,9 +667,43 @@ async def cb_ans_control(call: types.CallbackQuery):
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("ans:qcond:"))
+async def cb_ans_question_condition(call: types.CallbackQuery, bot: Bot):
+    """1-savol shartini (matn yoki rasm) foydalanuvchiga yuboradi (testni tekshirish uchun)."""
+    _, _, kind, ctrl_id = call.data.split(":")
+    ans_data = await asyncio.to_thread(get_control_answers_sync, kind, ctrl_id)
+    questions = ans_data.get("questions", [])
+
+    if not questions:
+        await call.answer("Savol topilmadi.", show_alert=True)
+        return
+
+    q1 = questions[0]
+    await call.answer("1-savol sharti yuborilmoqda...")
+
+    caption = "🔍 <b>1-savol sharti (Testni solishtirish uchun):</b>\nUshbu savol orqali qo'lingizdagi test aynan shu variant ekanligiga ishonch hosil qilishingiz mumkin."
+
+    if q1.get("q_images"):
+        for num, img_url in enumerate(q1["q_images"], start=1):
+            c_text = caption + (f" ({num}/{len(q1['q_images'])})" if len(q1["q_images"]) > 1 else "")
+            img_bytes = await asyncio.to_thread(_fetch_bytes, img_url)
+            if img_bytes:
+                file = BufferedInputFile(img_bytes, filename=f"1_savol_sharti_{num}.webp")
+                await bot.send_photo(chat_id=call.message.chat.id, photo=file, caption=c_text, parse_mode="HTML")
+            else:
+                await bot.send_photo(chat_id=call.message.chat.id, photo=img_url, caption=c_text, parse_mode="HTML")
+    elif q1.get("q_text"):
+        await call.message.answer(
+            f"🔍 <b>1-savol sharti (Testni solishtirish uchun):</b>\n\n<i>«{html.escape(q1['q_text'])}»</i>",
+            parse_mode="HTML",
+        )
+    else:
+        await call.answer("1-savol sharti topilmadi.", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("ans:q:"))
 async def cb_ans_question_image(call: types.CallbackQuery, bot: Bot):
-    """Foydalanuvchi bitta savolning skrinshotini so'raganda yuboradi."""
+    """Foydalanuvchi bitta savolning yechim skrinshotini so'raganda yuboradi."""
     _, _, kind, ctrl_id, q_idx_str = call.data.split(":")
     q_idx = int(q_idx_str)
 
