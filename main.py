@@ -31,6 +31,7 @@ from schedule import (
     send_teacher_morning,
 )
 from command import router
+from test import router as test_router
 
 
 # --- BAN MIDDLEWARE (banned users are silently ignored) ---
@@ -125,6 +126,7 @@ async def main():
 
     dp.message.outer_middleware(BanMiddleware())
     dp.callback_query.outer_middleware(BanMiddleware())
+    dp.include_router(test_router)
     dp.include_router(router)
 
     scheduler = setup_scheduler(bot)
