@@ -1,5 +1,6 @@
 """
 test.py - BSB va CHSB javoblarini test-uz.ru saytidan olish moduli
+O'quv yillari (2026-2027, 2025-2026) bo'yicha ajratish va skrinshot javoblarni tartib bilan ko'rsatish
 """
 import re
 import html
@@ -16,6 +17,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BufferedInputFile,
+    InputMediaPhoto,
 )
 
 router = Router()
@@ -31,7 +33,7 @@ USER_AGENT = (
 # CACHE (Tezlikni oshirish va saytni yuklamaslik uchun)
 # ---------------------------------------------------------
 _CACHE = {}
-CACHE_TTL = 600  # 10 daqiqa
+CACHE_TTL = 300  # 5 daqiqa kesh
 
 
 def _get_cache(key: str):
@@ -98,7 +100,6 @@ def get_subjects_sync(kind: str, grade: int) -> list[dict]:
     for m in pattern.finditer(content):
         cat_id = m.group(1)
         raw_name = re.sub(r"<[^<]+?>", "", m.group(2)).strip()
-        # "Fizika / Physics" -> "Fizika"
         clean_name = raw_name.split("/")[0].strip()
         clean_name = html.unescape(clean_name)
         if cat_id not in seen and clean_name:
@@ -109,9 +110,12 @@ def get_subjects_sync(kind: str, grade: int) -> list[dict]:
     return subjects
 
 
-def get_controls_sync(kind: str, cat_id: str) -> list[dict]:
-    """Fan bo'yicha barcha nazorat ishlari / variantlar ro'yxatini oladi."""
-    cache_key = f"ctrls:{kind}:{cat_id}"
+def get_controls_by_year_sync(kind: str, cat_id: str) -> dict[str, list[dict]]:
+    """
+    Fan sahifasidagi testlarni o'quv yillari (2026-2027, 2025-2026 va h.k.)
+    bo'yicha ajratib oladi.
+    """
+    cache_key = f"ctrls_yr:{kind}:{cat_id}"
     cached = _get_cache(cache_key)
     if cached is not None:
         return cached
@@ -120,28 +124,43 @@ def get_controls_sync(kind: str, cat_id: str) -> list[dict]:
     url = f"{BASE_URL}/{page}?cat={cat_id}"
     content = _fetch_html(url)
     if not content:
-        return []
+        return {}
 
-    pattern = re.compile(
-        rf'<a\s+[^>]*href=["\'](?:{page})?\?control=(\d+)["\'][^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    controls = []
-    seen = set()
-    for m in pattern.finditer(content):
-        ctrl_id = m.group(1)
-        raw_title = re.sub(r"<[^<]+?>", "", m.group(2)).strip()
-        clean_title = " ".join(raw_title.split())
-        clean_title = html.unescape(clean_title)
-        if ctrl_id not in seen and clean_title:
-            seen.add(ctrl_id)
-            controls.append({"id": ctrl_id, "title": clean_title})
+    # Sahifani h2 teglari bo'yicha bo'laklarga ajratamiz (o'quv yillarini aniqlash uchun)
+    parts = re.split(r"(<h2[^>]*>.*?</h2>)", content, flags=re.IGNORECASE | re.DOTALL)
 
-    _set_cache(cache_key, controls, ttl=600)
-    return controls
+    years: dict[str, list[dict]] = {}
+    current_year = "2026-2027"
+
+    for part in parts:
+        h_m = re.match(r"<h2[^>]*>(.*?)</h2>", part, flags=re.IGNORECASE | re.DOTALL)
+        if h_m:
+            text = re.sub(r"<[^<]+?>", "", h_m.group(1)).strip()
+            ym = re.search(r"(\d{4}\s*-\s*\d{4})", text)
+            if ym:
+                current_year = ym.group(1).replace(" ", "")
+            continue
+
+        ctrl_pattern = re.compile(
+            rf'<a\s+[^>]*href=["\'](?:{page})?\?control=(\d+)["\'][^>]*>(.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for m in ctrl_pattern.finditer(part):
+            c_id = m.group(1)
+            raw_title = re.sub(r"<[^<]+?>", "", m.group(2)).strip()
+            clean_title = " ".join(raw_title.split())
+            clean_title = html.unescape(clean_title)
+
+            if current_year not in years:
+                years[current_year] = []
+            if not any(x["id"] == c_id for x in years[current_year]):
+                years[current_year].append({"id": c_id, "title": clean_title})
+
+    _set_cache(cache_key, years, ttl=600)
+    return years
 
 
-def _fetch_single_question(kind: str, q_id: str) -> dict:
+def _fetch_single_question(kind: str, q_id: str, label: str) -> dict:
     """Bitta savol sahifasidagi yechim yoki javobni tahlil qiladi."""
     page = "sor_uz.php" if kind == "bsb" else "soch_uz.php"
     url = f"{BASE_URL}/{page}?id={q_id}"
@@ -186,6 +205,7 @@ def _fetch_single_question(kind: str, q_id: str) -> dict:
     is_answered = bool(ans_text or sol_imgs)
     return {
         "id": q_id,
+        "label": label,
         "text": ans_text,
         "images": sol_imgs,
         "has_answer": is_answered,
@@ -203,26 +223,45 @@ def get_control_answers_sync(kind: str, ctrl_id: str) -> dict:
     url = f"{BASE_URL}/{page}?control={ctrl_id}"
     content = _fetch_html(url)
     if not content:
-        return {"has_answers": False, "questions": [], "url": url}
+        return {"has_answers": False, "questions": [], "url": url, "title": ""}
 
-    # Barcha savollar ID sini aniqlash
+    # Sarlavhani olish
+    m_h1 = re.search(r"<h1[^>]*>(.*?)</h1>", content, re.IGNORECASE | re.DOTALL)
+    ctrl_title = ""
+    if m_h1:
+        ctrl_title = " ".join(re.sub(r"<[^<]+?>", "", m_h1.group(1)).split())
+        ctrl_title = html.unescape(ctrl_title)
+
+    # Barcha savollar ID va nomlarini aniqlash
     pattern = re.compile(
         rf'<a\s+[^>]*href=["\'](?:{page})?\?id=(\d+)["\'][^>]*>(.*?)</a>',
         re.IGNORECASE | re.DOTALL,
     )
-    q_matches = pattern.findall(content)
-    if not q_matches:
-        return {"has_answers": False, "questions": [], "url": url}
+    raw_matches = pattern.findall(content)
+    if not raw_matches:
+        return {"has_answers": False, "questions": [], "url": url, "title": ctrl_title}
 
-    # Savollarni tezkor yuklash uchun oqimlar (ThreadPoolExecutor)
+    q_items = []
+    for i, (q_id, raw_link_text) in enumerate(raw_matches, start=1):
+        cleaned = re.sub(r"<[^<]+?>", " ", raw_link_text)
+        cleaned = html.unescape(cleaned)
+        cleaned = cleaned.replace("→", "").replace("Question only; solution not yet available", "").strip()
+        cleaned = " ".join(cleaned.split())
+        label = re.sub(r"^Question\s*", "", cleaned, flags=re.IGNORECASE)
+        label = f"{label}-savol" if label.isdigit() else label
+        if not label:
+            label = f"{i}-savol"
+        q_items.append((q_id, label))
+
     with ThreadPoolExecutor(max_workers=8) as executor:
-        questions = list(executor.map(lambda item: _fetch_single_question(kind, item[0]), q_matches))
+        questions = list(executor.map(lambda item: _fetch_single_question(kind, item[0], item[1]), q_items))
 
     has_any = any(q["has_answer"] for q in questions)
     res = {
         "has_answers": has_any,
         "questions": questions,
         "url": url,
+        "title": ctrl_title,
     }
     _set_cache(cache_key, res, ttl=600)
     return res
@@ -269,7 +308,6 @@ def kb_grade_selection(kind: str) -> InlineKeyboardMarkup:
 def kb_subjects(kind: str, grade: int, subjects: list[dict]) -> InlineKeyboardMarkup:
     """Fanlar ro'yxati klaviaturasi."""
     rows = []
-    # 2 tadan tugma bir qatorda
     for i in range(0, len(subjects), 2):
         row = []
         for s in subjects[i:i + 2]:
@@ -285,8 +323,20 @@ def kb_subjects(kind: str, grade: int, subjects: list[dict]) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_controls(kind: str, grade: int, cat_id: str, controls: list[dict]) -> InlineKeyboardMarkup:
-    """Testlar / choraklar ro'yxati klaviaturasi."""
+def kb_years(kind: str, grade: int, cat_id: str, years: list[str]) -> InlineKeyboardMarkup:
+    """O'quv yillarini tanlash klaviaturasi."""
+    rows = []
+    for yr in years:
+        label = f"🎓 {yr} o'quv yili (Joriy)" if "2026" in yr else f"📚 {yr} o'quv yili"
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=f"ans:yr:{kind}:{grade}:{cat_id}:{yr}")
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Fanlar ro'yxati", callback_data=f"ans:gr:{kind}:{grade}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_controls(kind: str, grade: int, cat_id: str, year: str, controls: list[dict]) -> InlineKeyboardMarkup:
+    """Tanlangan o'quv yilidagi testlar ro'yxati klaviaturasi."""
     rows = []
     for c in controls:
         title = c["title"]
@@ -300,24 +350,42 @@ def kb_controls(kind: str, grade: int, cat_id: str, controls: list[dict]) -> Inl
         ])
 
     rows.append([
-        InlineKeyboardButton(text="⬅️ Boshqa fan", callback_data=f"ans:gr:{kind}:{grade}")
+        InlineKeyboardButton(text="⬅️ Boshqa o'quv yili", callback_data=f"ans:sub:{kind}:{grade}:{cat_id}")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_answers_menu(kind: str, grade: int, cat_id: str, ctrl_id: str, has_images: bool) -> InlineKeyboardMarkup:
-    """Javoblar ko'rsatilgandan keyingi navigatsiya."""
+def kb_answers_menu(kind: str, grade: int, cat_id: str, ctrl_id: str, questions: list[dict]) -> InlineKeyboardMarkup:
+    """Javoblar va skrinshotlarni tartib bilan ko'rish klaviaturasi."""
     rows = []
-    if has_images:
+
+    image_questions = [q for q in questions if q["images"]]
+    if image_questions:
+        q_buttons = []
+        for i, q in enumerate(questions):
+            if q["images"]:
+                lbl = q["label"]
+                if len(lbl) > 12:
+                    lbl = f"{i+1}-savol"
+                q_buttons.append(
+                    InlineKeyboardButton(
+                        text=f"{lbl} 🖼",
+                        callback_data=f"ans:q:{kind}:{ctrl_id}:{i}",
+                    )
+                )
+        for j in range(0, len(q_buttons), 3):
+            rows.append(q_buttons[j:j + 3])
+
         rows.append([
             InlineKeyboardButton(
-                text="📥 Barcha yechim rasmlarini olish",
+                text="📥 Barcha rasmlarni albomda yuklash",
                 callback_data=f"ans:all:{kind}:{ctrl_id}",
             )
         ])
+
     rows.append([
         InlineKeyboardButton(
-            text="⬅️ Boshqa variant",
+            text="⬅️ Variantlar ro'yxati",
             callback_data=f"ans:sub:{kind}:{grade}:{cat_id}",
         ),
         InlineKeyboardButton(
@@ -407,15 +475,15 @@ async def cb_ans_grade(call: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("ans:sub:"))
 async def cb_ans_subject(call: types.CallbackQuery):
+    """Fan tanlanganda uning testlarini o'quv yillari bo'yicha ajratadi."""
     _, _, kind, grade_str, cat_id = call.data.split(":")
     grade = int(grade_str)
 
-    await call.message.edit_text("⏳ <i>Mavjud testlar tekshirilmoqda...</i>", parse_mode="HTML")
+    await call.message.edit_text("⏳ <i>O'quv yillari va testlar yuklanmoqda...</i>", parse_mode="HTML")
 
-    controls = await asyncio.to_thread(get_controls_sync, kind, cat_id)
+    years_dict = await asyncio.to_thread(get_controls_by_year_sync, kind, cat_id)
 
-    # Agar testlar ro'yxati umuman bo'sh bo'lsa
-    if not controls:
+    if not years_dict:
         await call.message.edit_text(
             "❌ <b>Hozircha bunday javoblar mavjud emas</b>\n\n"
             "Ushbu fan bo'yicha saytda hali testlar yoki javoblar e'lon qilinmagan.",
@@ -430,28 +498,72 @@ async def cb_ans_subject(call: types.CallbackQuery):
         return
 
     title = "BSB" if kind == "bsb" else "CHSB"
+    years_list = sorted(list(years_dict.keys()), reverse=True)
+
+    if len(years_list) > 1:
+        await call.message.edit_text(
+            f"📅 <b>{grade}-sinf {title} — O'quv yilini tanlang:</b>\n"
+            "Kerakli o'quv yili variantlarini ko'rish uchun tanlang:",
+            parse_mode="HTML",
+            reply_markup=kb_years(kind, grade, cat_id, years_list),
+        )
+    else:
+        sole_year = years_list[0]
+        controls = years_dict[sole_year]
+        await call.message.edit_text(
+            f"📝 <b>{grade}-sinf {title} ({sole_year}) — Variantni tanlang:</b>",
+            parse_mode="HTML",
+            reply_markup=kb_controls(kind, grade, cat_id, sole_year, controls),
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ans:yr:"))
+async def cb_ans_year(call: types.CallbackQuery):
+    """Foydalanuvchi ma'lum bir o'quv yilini tanlaganda uning testlarini ko'rsatadi."""
+    _, _, kind, grade_str, cat_id, year = call.data.split(":")
+    grade = int(grade_str)
+
+    years_dict = await asyncio.to_thread(get_controls_by_year_sync, kind, cat_id)
+    controls = years_dict.get(year, [])
+
+    if not controls:
+        await call.message.edit_text(
+            f"❌ <b>Hozircha bunday javoblar mavjud emas</b>\n\n"
+            f"{year} o'quv yili uchun testlar topilmadi.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="⬅️ Boshqa o'quv yili", callback_data=f"ans:sub:{kind}:{grade}:{cat_id}")
+                ]]
+            ),
+        )
+        await call.answer()
+        return
+
+    title = "BSB" if kind == "bsb" else "CHSB"
     await call.message.edit_text(
-        f"📝 <b>{grade}-sinf {title} — Kerakli variant yoki chorakni tanlang:</b>",
+        f"📝 <b>{grade}-sinf {title} ({year}) — Variantni tanlang:</b>",
         parse_mode="HTML",
-        reply_markup=kb_controls(kind, grade, cat_id, controls),
+        reply_markup=kb_controls(kind, grade, cat_id, year, controls),
     )
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("ans:ctrl:"))
 async def cb_ans_control(call: types.CallbackQuery):
+    """Tanlangan test javoblarini formatlab ko'rsatadi."""
     _, _, kind, grade_str, cat_id, ctrl_id = call.data.split(":")
     grade = int(grade_str)
 
-    await call.message.edit_text("⏳ <i>Javoblar qidirilmoqda va yuklanmoqda...</i>", parse_mode="HTML")
+    await call.message.edit_text("⏳ <i>Javoblar va yechimlar tekshirilmoqda...</i>", parse_mode="HTML")
 
     ans_data = await asyncio.to_thread(get_control_answers_sync, kind, ctrl_id)
 
-    # Agar javoblar hali chiqmagan bo'lsa
     if not ans_data["has_answers"] or not ans_data["questions"]:
         await call.message.edit_text(
             "❌ <b>Hozircha bunday javoblar mavjud emas</b>\n\n"
-            "Ushbu test bo'yicha saytda faqat savollar e'lon qilingan yoki javoblar hali yuklanmagan.",
+            "Ushbu test bo'yicha saytda hali yechimlar yoki javoblar yuklanmagan (faqat savollar mavjud bo'lishi mumkin).",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[
@@ -462,88 +574,118 @@ async def cb_ans_control(call: types.CallbackQuery):
         await call.answer()
         return
 
-    # Javoblarni formatlash
     questions = ans_data["questions"]
     answered_count = sum(1 for q in questions if q["has_answer"])
     has_images = any(len(q["images"]) > 0 for q in questions)
-
-    # Matnli javoblarni yig'ish (A, B, C...)
-    text_answers = []
-    for i, q in enumerate(questions, start=1):
-        if q["text"]:
-            text_answers.append(f"<b>{i}-savol:</b> {q['text']}")
-        elif q["images"]:
-            text_answers.append(f"<b>{i}-savol:</b> 📷 Rasm yechim mavjud")
-        else:
-            text_answers.append(f"<b>{i}-savol:</b> <i>Javob yo'q</i>")
-
     title_kind = "BSB" if kind == "bsb" else "CHSB"
+
+    ctrl_name = ans_data.get("title") or f"{grade}-sinf {title_kind}"
     msg_lines = [
-        f"✅ <b>{grade}-sinf {title_kind} javoblari</b>\n",
-        f"📊 Jami {len(questions)} ta savoldan {answered_count} tasining javobi topildi.\n",
+        f"✅ <b>{html.escape(ctrl_name)} javoblari</b>\n",
+        f"📊 Jami {len(questions)} ta topshiriqdan {answered_count} tasining javobi mavjud.\n",
     ]
 
-    # Javoblarni 2 ustunda yoki qatorda chiqarish
-    if all(q["text"] and len(q["text"]) <= 3 for q in questions if q["has_answer"]):
-        # Test savollari (A, B, C...)
+    if all(q["text"] and len(q["text"]) <= 4 for q in questions if q["has_answer"]) and not has_images:
         cols = []
-        for i, q in enumerate(questions, start=1):
+        for q in questions:
             val = q["text"] if q["text"] else "—"
-            cols.append(f"<b>{i}.</b> {val}")
-        # Chiroyli 2 ustun qilib ko'rsatish
+            cols.append(f"<b>{q['label']}:</b> {val}")
         for i in range(0, len(cols), 2):
-            part = cols[i:i + 2]
-            msg_lines.append("        ".join(part))
+            msg_lines.append("        ".join(cols[i:i + 2]))
+    elif has_images:
+        msg_lines.append(
+            "📌 <b>Ushbu test yozma topshiriqlardan iborat bo'lib, javoblari skrinshot (rasm) shaklida.</b>\n"
+            "Savol javobini ko'rish uchun quyidagi tugmalardan foydalaning yoki barchasini tartib bilan yuklab oling:"
+        )
     else:
-        # Kengroq javoblar yoki aralash
-        msg_lines.extend(text_answers[:25])
+        for q in questions[:15]:
+            ans_val = q["text"] if q["text"] else "<i>Javob yo'q</i>"
+            msg_lines.append(f"<b>{q['label']}:</b> {ans_val}")
 
-    msg_lines.append(f"\n🔗 <a href='{ans_data['url']}'>Saytda ko'rish (test-uz.ru)</a>")
+    msg_lines.append(f"\n🔗 <a href='{ans_data['url']}'>test-uz.ru saytida ochish</a>")
 
     text = "\n".join(msg_lines)
     await call.message.edit_text(
         text,
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=kb_answers_menu(kind, grade, cat_id, ctrl_id, has_images),
+        reply_markup=kb_answers_menu(kind, grade, cat_id, ctrl_id, questions),
     )
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("ans:all:"))
-async def cb_ans_all_images(call: types.CallbackQuery, bot: Bot):
-    """Barcha mavjud yechim rasmlarini foydalanuvchiga yuboradi."""
-    _, _, kind, ctrl_id = call.data.split(":")
-    await call.answer("Rasmlar yuklanmoqda...", show_alert=False)
+@router.callback_query(F.data.startswith("ans:q:"))
+async def cb_ans_question_image(call: types.CallbackQuery, bot: Bot):
+    """Foydalanuvchi bitta savolning skrinshotini so'raganda yuboradi."""
+    _, _, kind, ctrl_id, q_idx_str = call.data.split(":")
+    q_idx = int(q_idx_str)
 
     ans_data = await asyncio.to_thread(get_control_answers_sync, kind, ctrl_id)
     questions = ans_data.get("questions", [])
 
-    sent_any = False
-    for i, q in enumerate(questions, start=1):
-        for img_url in q["images"]:
-            try:
-                # Rasmni to'g'ridan-to'g'ri yoki bayt qilib yuborish
-                img_bytes = await asyncio.to_thread(_fetch_bytes, img_url)
-                if img_bytes:
-                    file = BufferedInputFile(img_bytes, filename=f"savol_{i}_yechim.webp")
-                    await bot.send_photo(
-                        chat_id=call.message.chat.id,
-                        photo=file,
-                        caption=f"📝 <b>{i}-savol yechimi</b>",
-                        parse_mode="HTML",
-                    )
-                    sent_any = True
-                else:
-                    await bot.send_photo(
-                        chat_id=call.message.chat.id,
-                        photo=img_url,
-                        caption=f"📝 <b>{i}-savol yechimi</b>",
-                        parse_mode="HTML",
-                    )
-                    sent_any = True
-            except Exception as e:
-                logging.error(f"[test.py] Rasmni yuborishda xatolik: {e}")
+    if q_idx >= len(questions) or not questions[q_idx]["images"]:
+        await call.answer("Bu savol uchun rasm yechim mavjud emas.", show_alert=True)
+        return
 
-    if not sent_any:
+    q = questions[q_idx]
+    await call.answer(f"{q['label']} yechimi yuborilmoqda...")
+
+    for num, img_url in enumerate(q["images"], start=1):
+        caption_part = f" ({num}/{len(q['images'])})" if len(q["images"]) > 1 else ""
+        caption = f"📝 <b>{q['label']} yechimi{caption_part}</b>"
+
+        img_bytes = await asyncio.to_thread(_fetch_bytes, img_url)
+        if img_bytes:
+            file = BufferedInputFile(img_bytes, filename=f"savol_{q_idx+1}_yechim_{num}.webp")
+            await bot.send_photo(chat_id=call.message.chat.id, photo=file, caption=caption, parse_mode="HTML")
+        else:
+            await bot.send_photo(chat_id=call.message.chat.id, photo=img_url, caption=caption, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("ans:all:"))
+async def cb_ans_all_images(call: types.CallbackQuery, bot: Bot):
+    """
+    Barcha mavjud yechim rasmlarini aniq tartibda (1-savol, 2-savol...)
+    albom (MediaGroup) qilib yuboradi.
+    """
+    _, _, kind, ctrl_id = call.data.split(":")
+    await call.answer("Barcha rasmlar tartib bilan tayyorlanmoqda...", show_alert=False)
+
+    ans_data = await asyncio.to_thread(get_control_answers_sync, kind, ctrl_id)
+    questions = ans_data.get("questions", [])
+
+    ordered_items = []
+    for q in questions:
+        for num, img_url in enumerate(q["images"], start=1):
+            caption_part = f" ({num}/{len(q['images'])})" if len(q["images"]) > 1 else ""
+            ordered_items.append({
+                "label": f"📝 {q['label']} yechimi{caption_part}",
+                "url": img_url,
+            })
+
+    if not ordered_items:
         await call.message.answer("❌ Bu testda yechim rasmlari topilmadi.")
+        return
+
+    # Telegram send_media_group 10 tagacha rasm qabul qiladi
+    for batch_idx in range(0, len(ordered_items), 10):
+        batch = ordered_items[batch_idx:batch_idx + 10]
+        media_group = []
+
+        for item in batch:
+            img_bytes = await asyncio.to_thread(_fetch_bytes, item["url"])
+            if img_bytes:
+                media_group.append(
+                    InputMediaPhoto(
+                        media=BufferedInputFile(img_bytes, filename="yechim.webp"),
+                        caption=item["label"],
+                    )
+                )
+
+        if media_group:
+            try:
+                await bot.send_media_group(chat_id=call.message.chat.id, media=media_group)
+            except Exception as e:
+                logging.error(f"[test.py] send_media_group xatosi: {e}")
+                for m in media_group:
+                    await bot.send_photo(chat_id=call.message.chat.id, photo=m.media, caption=m.caption)
